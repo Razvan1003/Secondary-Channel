@@ -20,17 +20,14 @@ secundar de siguranta:
 
 ## Ce face V1
 
-Versiunea 1 implementeaza strict logica minima de baza:
+Versiunea 1 implementeaza logica de urgenta validata in simulare:
 
-- se conecteaza la un flux MAVLink folosind `pymavlink`
-- asteapta primul `HEARTBEAT`
-- memoreaza momentul ultimului heartbeat primit
-- afiseaza in consola heartbeat-urile primite normal
-- considera canalul pierdut daca nu mai primeste heartbeat timp de 5 secunde
-- afiseaza mesajele:
-  - `Primary link lost`
-  - `Secondary channel activated`
-- trimite o singura data comanda `RTL` pentru fiecare eveniment de pierdere
+- monitorizeaza `HEARTBEAT` pe o conexiune dedicata
+- considera linkul pierdut dupa 5 secunde fara heartbeat
+- activeaza failover-ul logic prin mesajul `Secondary channel activated`
+- trimite comanda `RTL`
+- asteapta `COMMAND_ACK` pentru `RTL`
+- ramane in stare de urgenta pana la reset manual
 
 ## Arhitectura de test folosita
 
@@ -44,7 +41,8 @@ un al doilea `--out` configurat in MAVProxy.
 Exemplu de configurare folosita:
 
 - `14550` pentru Mission Planner
-- `14560` pentru scriptul Python
+- `14560` pentru monitorizarea heartbeat-ului in script
+- `5762` pentru conexiunea separata de comanda folosita de script
 
 ## Fisierul principal
 
@@ -65,20 +63,25 @@ pip install pymavlink
 
 In script exista cateva constante usor de modificat:
 
-- `MAVLINK_CONNECTION`
+- `MONITOR_CONNECTION`
+- `COMMAND_CONNECTION`
 - `HEARTBEAT_TIMEOUT`
 - `CHECK_INTERVAL`
+- `COMMAND_ACK_TIMEOUT`
 
 Configuratia implicita din V1 este:
 
 ```python
-MAVLINK_CONNECTION = "udpin:0.0.0.0:14560"
+MONITOR_CONNECTION = "udpin:0.0.0.0:14560"
+COMMAND_CONNECTION = "tcp:172.30.214.87:5762"
 HEARTBEAT_TIMEOUT = 5
-CHECK_INTERVAL = 0.5
+CHECK_INTERVAL = 0.2
+COMMAND_ACK_TIMEOUT = 3
 ```
 
-Aceasta configuratie a fost aleasa pentru un setup in care MAVProxy ruleaza in
-WSL, iar scriptul Python ruleaza pe Windows.
+Aceasta configuratie a fost folosita pentru un setup in care MAVProxy ruleaza
+in WSL, iar scriptul Python ruleaza pe Windows. Daca IP-ul din WSL se schimba,
+valoarea `COMMAND_CONNECTION` trebuie actualizata.
 
 ## Rulare
 
@@ -104,10 +107,16 @@ sim_vehicle.py -v ArduCopter -f quad --map --console --out=172.30.208.1:14550 --
 
 1. Se porneste simularea ArduPilot SITL.
 2. Se porneste Mission Planner pe `UDP 14550`.
-3. Se porneste scriptul Python pentru canalul secundar.
-4. Scriptul trebuie sa afiseze heartbeat-urile primite normal.
-5. La intreruperea fluxului de heartbeat pentru mai mult de 5 secunde,
-   scriptul afiseaza pierderea canalului si trimite `RTL`.
+3. Se porneste scriptul Python.
+4. Vehiculul este trecut in `GUIDED`, armat si ridicat la 5 m.
+5. In MAVProxy se elimina doar output-ul monitorizat de script:
+   `output remove 172.30.208.1:14560`
+6. Scriptul trebuie sa afiseze:
+   - `Primary link lost`
+   - `Secondary channel activated`
+   - `RTL command sent. Waiting for COMMAND_ACK...`
+   - `COMMAND_ACK received for RTL: MAV_RESULT_ACCEPTED`
+7. Mission Planner trebuie sa indice trecerea in `RTL`.
 
 ## Limitari V1
 
@@ -120,9 +129,9 @@ Aceasta versiune este intentionat simpla si nu include:
 - telemetrie inapoi
 - logica avansata pentru mai multe tipuri de esec
 
-In plus, V1 detecteaza pierderea heartbeat-ului pe fluxul monitorizat. Daca
-sursa este oprita complet, comanda `RTL` este demonstrata logic la nivel de
-script, dar vehiculul poate sa nu mai fie disponibil pentru executia ei.
+In plus, V1 foloseste o conexiune separata pentru trimiterea comenzii `RTL`,
+astfel incat failover-ul sa poata fi validat cu `COMMAND_ACK` chiar daca fluxul
+de heartbeat monitorizat este intrerupt.
 
 ## Rolul versiunii V1
 
@@ -131,4 +140,5 @@ Aceasta versiune are rol didactic si de validare experimentala:
 - demonstreaza ca un proces Python separat poate monitoriza MAVLink
 - demonstreaza detectia unui timeout de heartbeat
 - demonstreaza activarea unei reactii automate de urgenta
+- demonstreaza confirmarea comenzii critice prin `COMMAND_ACK`
 - ofera o baza clara pentru versiuni ulterioare mai complexe
