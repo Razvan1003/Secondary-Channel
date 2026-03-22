@@ -2,58 +2,53 @@
 
 Canal secundar de urgenta pentru o drona bazata pe MAVLink.
 
-Acest repository contine **Versiunea 1 (V1)** a unui script Python separat,
-realizat pentru un proiect de licenta. Scriptul nu este integrat in Mission
-Planner si nu inlocuieste canalul principal. Rolul lui este sa functioneze ca
-un mecanism simplu de monitorizare si reactie de urgenta.
+Acest repository contine scripturi Python separate, realizate pentru un
+proiect de licenta. Scripturile sunt folosite pentru validarea incrementala a
+unui canal secundar de siguranta in simulare, fara integrare hardware reala.
 
 ## Scop
 
-Scopul proiectului este demonstratia unei logici de baza pentru un canal
+Scopul proiectului este demonstratia unei logici simple pentru un canal
 secundar de siguranta:
 
-- conectare la un flux MAVLink
-- monitorizare a mesajelor `HEARTBEAT`
-- detectare a pierderii fluxului dupa un timeout de 5 secunde
-- afisare de mesaje clare in consola
-- trimitere automata a unei comenzi `RTL` (`Return To Launch`)
+- monitorizare MAVLink
+- detectie de evenimente critice
+- activare a unei reactii de urgenta
+- validare experimentala in ArduPilot SITL
 
-## Ce face V1
+## Versiuni incluse
 
-Versiunea 1 implementeaza logica de urgenta validata in simulare:
+- `secondary_channel_v1.py`
+  - failover automat dupa pierderea heartbeat-ului
+  - activare logica secundara
+  - trimitere `RTL`
+  - verificare `COMMAND_ACK`
+- `secondary_channel_v2_1.py`
+  - activare manuala a canalului secundar
+  - mentinere a pozitiei si altitudinii curente
+  - implementare prin `GUIDED hold` pe baza pozitiei curente
+  - confirmare operationala in Mission Planner
 
-- monitorizeaza `HEARTBEAT` pe o conexiune dedicata
-- considera linkul pierdut dupa 5 secunde fara heartbeat
-- activeaza failover-ul logic prin mesajul `Secondary channel activated`
-- trimite comanda `RTL`
-- asteapta `COMMAND_ACK` pentru `RTL`
-- ramane in stare de urgenta pana la reset manual
+## Arhitectura de test
 
-## Arhitectura de test folosita
-
-Scriptul a fost testat in simulare cu urmatoarea arhitectura:
+Scripturile au fost testate in simulare cu:
 
 `ArduPilot SITL -> MAVProxy -> Mission Planner`
 
-In paralel cu Mission Planner, scriptul primeste un flux MAVLink separat prin
-un al doilea `--out` configurat in MAVProxy.
-
-Exemplu de configurare folosita:
+Endpoint-uri MAVLink folosite in test:
 
 - `14550` pentru Mission Planner
-- `14560` pentru monitorizarea heartbeat-ului in script
-- `5762` pentru conexiunea separata de comanda folosita de script
+- `14560` pentru scriptul Python al canalului secundar
+- `5762` pentru conexiunea separata de comanda folosita in V1
 
-## Fisierul principal
-
-- `secondary_channel_v1.py`
+Aceste porturi sunt endpoint-uri software de simulare, nu canale RF reale.
 
 ## Cerinte
 
 - Python 3
 - `pymavlink`
 
-Instalare dependinta:
+Instalare:
 
 ```bash
 pip install pymavlink
@@ -61,15 +56,9 @@ pip install pymavlink
 
 ## Configurare
 
-In script exista cateva constante usor de modificat:
+### V1
 
-- `MONITOR_CONNECTION`
-- `COMMAND_CONNECTION`
-- `HEARTBEAT_TIMEOUT`
-- `CHECK_INTERVAL`
-- `COMMAND_ACK_TIMEOUT`
-
-Configuratia implicita din V1 este:
+Configuratia implicita din `secondary_channel_v1.py` este:
 
 ```python
 MONITOR_CONNECTION = "udpin:0.0.0.0:14560"
@@ -79,35 +68,45 @@ CHECK_INTERVAL = 0.2
 COMMAND_ACK_TIMEOUT = 3
 ```
 
-Aceasta configuratie a fost folosita pentru un setup in care MAVProxy ruleaza
-in WSL, iar scriptul Python ruleaza pe Windows. Daca IP-ul din WSL se schimba,
-valoarea `COMMAND_CONNECTION` trebuie actualizata.
+Configuratia a fost folosita intr-un setup in care MAVProxy ruleaza in WSL,
+iar scriptul Python ruleaza pe Windows. Daca IP-ul din WSL se schimba, valoarea
+`COMMAND_CONNECTION` trebuie actualizata.
+
+### V2.1
+
+Configuratia implicita din `secondary_channel_v2_1.py` este:
+
+```python
+MAVLINK_CONNECTION = "udpin:0.0.0.0:14560"
+CHECK_INTERVAL = 0.2
+HOLD_SEND_INTERVAL = 0.5
+```
 
 ## Rulare
 
-Pornire script:
+Pornire V1:
 
 ```bash
 python secondary_channel_v1.py
 ```
 
-Exemplu de pornire a simularii cu doua iesiri MAVLink:
+Pornire V2.1:
 
 ```bash
-sim_vehicle.py -v ArduCopter -f quad --map --console --out=127.0.0.1:14550 --out=127.0.0.1:14560
+python secondary_channel_v2_1.py
 ```
 
-Sau, pentru unele configuratii WSL -> Windows:
+Exemplu de pornire SITL:
 
 ```bash
 sim_vehicle.py -v ArduCopter -f quad --map --console --out=172.30.208.1:14550 --out=172.30.208.1:14560
 ```
 
-## Test rapid
+## Test rapid V1
 
 1. Se porneste simularea ArduPilot SITL.
 2. Se porneste Mission Planner pe `UDP 14550`.
-3. Se porneste scriptul Python.
+3. Se porneste scriptul Python V1.
 4. Vehiculul este trecut in `GUIDED`, armat si ridicat la 5 m.
 5. In MAVProxy se elimina doar output-ul monitorizat de script:
    `output remove 172.30.208.1:14560`
@@ -118,27 +117,48 @@ sim_vehicle.py -v ArduCopter -f quad --map --console --out=172.30.208.1:14550 --
    - `COMMAND_ACK received for RTL: MAV_RESULT_ACCEPTED`
 7. Mission Planner trebuie sa indice trecerea in `RTL`.
 
-## Limitari V1
+## Test rapid V2.1
 
-Aceasta versiune este intentionat simpla si nu include:
+1. Se porneste simularea ArduPilot SITL.
+2. Se porneste Mission Planner pe `UDP 14550`.
+3. Se porneste scriptul `secondary_channel_v2_1.py`.
+4. Vehiculul este trecut in `GUIDED`, armat si ridicat la 5 m.
+5. In consola scriptului se apasa `h` sau `l`.
+6. Scriptul trebuie sa afiseze:
+   - `Manual secondary-channel activation requested`
+   - `Sending GUIDED hold target based on current position...`
+   - `GUIDED hold is active`
+7. Mission Planner trebuie sa arate ca vehiculul ramane in `GUIDED`
+   si mentine aproximativ pozitia si altitudinea curenta.
+
+## Limitari
+
+V1 nu include:
 
 - `LAND`
 - `HOLD`
 - comutare manuala
-- interfata grafica
-- telemetrie inapoi
-- logica avansata pentru mai multe tipuri de esec
+- telemetrie avansata
+- GUI
 
-In plus, V1 foloseste o conexiune separata pentru trimiterea comenzii `RTL`,
-astfel incat failover-ul sa poata fi validat cu `COMMAND_ACK` chiar daca fluxul
-de heartbeat monitorizat este intrerupt.
+V2.1 nu include:
 
-## Rolul versiunii V1
+- `LAND`
+- selectie multipla de comenzi
+- control complet roll/pitch/yaw
+- telemetrie complexa
+- hardware LoRa real
 
-Aceasta versiune are rol didactic si de validare experimentala:
+In V2.1, `GUIDED hold` este implementat cu mesaje
+`SET_POSITION_TARGET_GLOBAL_INT`. Aceste mesaje nu intorc `COMMAND_ACK`, astfel
+ca validarea este operationala: vehiculul trebuie sa ramana in `GUIDED` si sa
+isi mentina aproximativ pozitia si altitudinea curenta.
 
-- demonstreaza ca un proces Python separat poate monitoriza MAVLink
-- demonstreaza detectia unui timeout de heartbeat
-- demonstreaza activarea unei reactii automate de urgenta
-- demonstreaza confirmarea comenzii critice prin `COMMAND_ACK`
-- ofera o baza clara pentru versiuni ulterioare mai complexe
+## Rolul repository-ului
+
+Acest repository are rol didactic si de validare experimentala:
+
+- demonstreaza monitorizarea MAVLink dintr-un proces Python separat
+- demonstreaza un failover automat de tip `RTL`
+- demonstreaza o activare manuala de tip `GUIDED hold`
+- ofera o baza clara pentru etape viitoare mai complexe
