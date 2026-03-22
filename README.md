@@ -33,6 +33,11 @@ secundar de siguranta:
   - trimitere comanda `LAND`
   - verificare `COMMAND_ACK`
   - confirmare operationala in Mission Planner
+- `secondary_channel_v2_3.py`
+  - activare manuala combinata
+  - `GUIDED hold` prin tasta `h`
+  - `LAND` prin tasta `d`
+  - scenariu incremental hold apoi land
 
 ## Arhitectura de test
 
@@ -97,6 +102,17 @@ CHECK_INTERVAL = 0.2
 COMMAND_ACK_TIMEOUT = 3
 ```
 
+### V2.3
+
+Configuratia implicita din `secondary_channel_v2_3.py` este:
+
+```python
+MAVLINK_CONNECTION = "udpin:0.0.0.0:14560"
+CHECK_INTERVAL = 0.2
+HOLD_SEND_INTERVAL = 0.5
+COMMAND_ACK_TIMEOUT = 3
+```
+
 ## Rulare
 
 Pornire V1:
@@ -115,6 +131,12 @@ Pornire V2.2:
 
 ```bash
 python secondary_channel_v2_2.py
+```
+
+Pornire V2.3:
+
+```bash
+python secondary_channel_v2_3.py
 ```
 
 Exemplu de pornire SITL:
@@ -166,6 +188,22 @@ sim_vehicle.py -v ArduCopter -f quad --map --console --out=172.30.208.1:14550 --
 7. Mission Planner trebuie sa arate trecerea in `LAND`
    si coborarea controlata spre sol.
 
+## Test rapid V2.3
+
+1. Se porneste simularea ArduPilot SITL.
+2. Se porneste Mission Planner pe `UDP 14550`.
+3. Se porneste scriptul `secondary_channel_v2_3.py`.
+4. Vehiculul este trecut in `GUIDED`, armat si ridicat la 5 m.
+5. In consola scriptului se apasa `h` pentru `GUIDED hold`.
+6. Se verifica mentinerea pozitiei si a altitudinii curente.
+7. In acelasi zbor, in consola scriptului se apasa `d` pentru `LAND`.
+8. Scriptul trebuie sa afiseze:
+   - activarea `GUIDED hold`
+   - apoi `Sending LAND command...`
+   - `COMMAND_ACK received for LAND: MAV_RESULT_ACCEPTED`
+9. Mission Planner trebuie sa arate mai intai mentinerea in `GUIDED`,
+   apoi trecerea in `LAND` si coborarea spre sol.
+
 ## Limitari
 
 V1 nu include:
@@ -191,6 +229,13 @@ V2.2 nu include:
 - telemetrie complexa
 - hardware LoRa real
 
+V2.3 nu include:
+
+- selectie avansata de comenzi
+- telemetrie complexa
+- control complet roll/pitch/yaw
+- hardware LoRa real
+
 In V2.1, `GUIDED hold` este implementat cu mesaje
 `SET_POSITION_TARGET_GLOBAL_INT`. Aceste mesaje nu intorc `COMMAND_ACK`, astfel
 ca validarea este operationala: vehiculul trebuie sa ramana in `GUIDED` si sa
@@ -200,6 +245,9 @@ In V2.2, `LAND` este implementat cu `MAV_CMD_NAV_LAND`, astfel incat validarea
 se face atat prin `COMMAND_ACK`, cat si operational, prin observarea coborarii
 si a aterizarii in Mission Planner.
 
+In V2.3, aceeasi sesiune de test poate combina doua actiuni manuale:
+mai intai `GUIDED hold`, apoi `LAND`.
+
 ## Rolul repository-ului
 
 Acest repository are rol didactic si de validare experimentala:
@@ -208,4 +256,5 @@ Acest repository are rol didactic si de validare experimentala:
 - demonstreaza un failover automat de tip `RTL`
 - demonstreaza o activare manuala de tip `GUIDED hold`
 - demonstreaza o activare manuala de tip `LAND`
+- demonstreaza un scenariu combinat `hold` urmat de `land`
 - ofera o baza clara pentru etape viitoare mai complexe
