@@ -48,6 +48,12 @@ secundar de siguranta:
   - meniul apare doar dupa `Primary link lost`
   - optiuni: `r = RTL`, `h = HOLD`, `l = LAND`
   - executie a reactiei alese fara editarea codului sursa
+- `secondary_channel_v3_1.py`
+  - pastreaza logica din `V2.5`
+  - adauga logging structurat in consola si in fisier `.txt`
+  - logheaza status minim: mod, stare armed/disarmed, altitudine, link state
+  - continua observatia pe `command link` dupa failover
+  - logheaza heartbeat, mod, altitudine si pozitie pe secondary
 
 ## Arhitectura de test
 
@@ -59,7 +65,7 @@ Endpoint-uri MAVLink folosite in test:
 
 - `14550` pentru Mission Planner
 - `14560` pentru scriptul Python al canalului secundar
-- `5762` pentru conexiunea separata de comanda folosita in V1, V2.4 si V2.5
+- `5762` pentru conexiunea separata de comanda folosita in V1, V2.4, V2.5 si V3.1
 
 Aceste porturi sunt endpoint-uri software de simulare, nu canale RF reale.
 
@@ -165,6 +171,40 @@ heartbeat-ului, direct din consola:
 - `h = HOLD`
 - `l = LAND`
 
+### V3.1
+
+Configuratia implicita din `secondary_channel_v3_1.py` este:
+
+```python
+MONITOR_CONNECTION = "udpin:0.0.0.0:14560"
+COMMAND_CONNECTION = "tcp:172.30.214.87:5762"
+HEARTBEAT_TIMEOUT = 5
+CHECK_INTERVAL = 0.2
+COMMAND_ACK_TIMEOUT = 3
+HOLD_SEND_INTERVAL = 0.5
+POSITION_CAPTURE_TIMEOUT = 1.0
+GLOBAL_POSITION_INTERVAL_US = 500000
+SECONDARY_HEARTBEAT_TIMEOUT = 1.5
+SECONDARY_LOG_INTERVAL = 1.0
+SECONDARY_NO_HEARTBEAT_RELOG_INTERVAL = 5.0
+```
+
+In V3.1:
+
+- meniul de actiuni apare dupa pierderea heartbeat-ului
+- logul este afisat in consola si salvat in fisier `.txt`
+- dupa failover, scriptul continua sa observe `command link`
+- sunt logate:
+  - `HEARTBEAT_OK`
+  - `LINK_TIMEOUT`
+  - `SECONDARY_ACTIVATED`
+  - `ACTION_SELECTED`
+  - `COMMAND_ACK`
+  - `SECONDARY_HEARTBEAT_OK`
+  - `SECONDARY_MODE_OBSERVED`
+  - `SECONDARY_ALTITUDE_OBSERVED`
+  - `SECONDARY_POSITION_OBSERVED`
+
 ## Rulare
 
 Pornire V1:
@@ -201,6 +241,12 @@ Pornire V2.5:
 
 ```bash
 python secondary_channel_v2_5.py
+```
+
+Pornire V3.1:
+
+```bash
+python secondary_channel_v3_1.py
 ```
 
 Exemplu de pornire SITL:
@@ -304,6 +350,33 @@ sim_vehicle.py -v ArduCopter -f quad --map --console --out=172.30.208.1:14550 --
    - `LAND` cu `COMMAND_ACK`
    - `HOLD` prin `GUIDED hold`
 
+## Test rapid V3.1
+
+1. Se porneste simularea ArduPilot SITL.
+2. Se porneste Mission Planner pe `UDP 14550`.
+3. Se porneste scriptul `secondary_channel_v3_1.py`.
+4. Vehiculul este trecut in `GUIDED`, armat si ridicat la 5 m.
+5. In MAVProxy se elimina output-ul monitorizat de script:
+   `output remove 172.30.208.1:14560`
+6. Dupa timeout, scriptul trebuie sa afiseze:
+   - `LINK_TIMEOUT`
+   - `MONITOR_LINK_LOST`
+   - `SECONDARY_ACTIVATED`
+   - meniul cu `r = RTL`, `h = HOLD`, `l = LAND`
+7. Operatorul alege reactia direct in consola.
+8. Scriptul executa reactia si continua observatia pe `command link`.
+9. Pentru `RTL` si `LAND`, se verifica:
+   - `COMMAND_SENT`
+   - `COMMAND_ACK`
+   - `SECONDARY_MODE_OBSERVED`
+10. Pentru `HOLD`, se verifica:
+   - `POSITION_SOURCE`
+   - `HOLD_ACTIVE`
+   - `SECONDARY_HEARTBEAT_OK`
+   - `SECONDARY_ALTITUDE_OBSERVED`
+   - `SECONDARY_POSITION_OBSERVED`
+11. Se verifica si fisierul `.txt` generat in acelasi folder.
+
 ## Limitari
 
 V1 nu include:
@@ -352,6 +425,14 @@ V2.5 nu include:
 - control complet roll/pitch/yaw
 - hardware LoRa real
 
+V3.1 nu include:
+
+- GUI
+- telemetrie complexa
+- control complet roll/pitch/yaw
+- hardware LoRa real
+- monitorizare avansata pe termen lung
+
 In V2.1, `GUIDED hold` este implementat cu mesaje
 `SET_POSITION_TARGET_GLOBAL_INT`. Aceste mesaje nu intorc `COMMAND_ACK`, astfel
 ca validarea este operationala: vehiculul trebuie sa ramana in `GUIDED` si sa
@@ -376,4 +457,6 @@ Acest repository are rol didactic si de validare experimentala:
 - demonstreaza un failover automat configurabil prin `rtl`, `hold` sau `land`
 - demonstreaza alegerea reactiei de urgenta dupa pierderea linkului, fara
   editarea codului sursa
+- demonstreaza logging structurat in consola si in fisier `.txt`
+- demonstreaza observatia continua a secondary link-ului dupa failover
 - ofera o baza clara pentru etape viitoare mai complexe
