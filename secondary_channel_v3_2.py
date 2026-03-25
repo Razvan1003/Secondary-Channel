@@ -28,16 +28,25 @@ SECONDARY_HEARTBEAT_TIMEOUT = 1.5
 SECONDARY_LOG_INTERVAL = 1.0
 SECONDARY_NO_HEARTBEAT_RELOG_INTERVAL = 5.0
 SECONDARY_CONNECT_TIMEOUT = 10.0
+ARM_DISARM_STATE_TIMEOUT = 5.0
+TAKEOFF_STATE_TIMEOUT = 12.0
+TAKEOFF_ALTITUDE_M = 5.0
+TAKEOFF_MIN_CLIMB_M = 0.8
+TAKEOFF_MAX_START_ALT_M = 0.5
+DISARM_MAX_ALTITUDE_M = 0.5
 ACTION_CHOICES = {
     "r": "rtl",
     "h": "hold",
     "l": "land",
+    "a": "arm",
+    "d": "disarm",
+    "t": "takeoff",
 }
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE_PATH = os.path.join(
     SCRIPT_DIR,
-    f"secondary_channel_v3_1_log_{time.strftime('%Y%m%d_%H%M%S')}.txt",
+    f"secondary_channel_v3_2_log_{time.strftime('%Y%m%d_%H%M%S')}.txt",
 )
 
 STATUS = {
@@ -156,6 +165,12 @@ def flight_mode_name(message):
         return mavutil.mode_string_v10(message)
     except Exception:
         return "UNKNOWN"
+
+
+def is_guided_mode(mode):
+    if mode is None:
+        return False
+    return mode.upper().startswith("GUIDED")
 
 
 def armed_state_from_heartbeat(message):
@@ -329,20 +344,23 @@ def select_emergency_action():
     log_event(
         "INFO",
         "ACTION_MENU_SHOWN",
-        "options=RTL,HOLD,LAND",
+        "options=RTL,HOLD,LAND,ARM,DISARM,TAKEOFF",
     )
     print()
     print("Select emergency action:")
     print("  r = RTL")
     print("  h = HOLD")
     print("  l = LAND")
+    print("  a = ARM")
+    print("  d = DISARM")
+    print("  t = TAKEOFF")
 
     while True:
-        choice = input("Enter your choice (r/h/l): ").strip().lower()
+        choice = input("Enter your choice (r/h/l/a/d/t): ").strip().lower()
         action = ACTION_CHOICES.get(choice)
 
         if action is None:
-            print("Invalid choice. Use r, h or l.")
+            print("Invalid choice. Use r, h, l, a, d or t.")
             continue
 
         log_event("INFO", "ACTION_SELECTED", f"action={action.upper()}")
@@ -559,6 +577,291 @@ def send_land_and_wait_ack(command_master, target_system, target_component):
     )
 
 
+def ensure_current_altitude(command_master, target_system, target_component):
+    if STATUS["current_altitude"] is not None:
+        return STATUS["current_altitude"]
+
+    capture_current_position(command_master, target_system, target_component)
+    return STATUS["current_altitude"]
+
+
+def log_precheck_failed(action, reason):
+    log_event(
+        "WARN",
+        "PRECHECK_FAILED",
+        f"action={action} reason={reason}",
+    )
+
+
+def send_arm_disarm_and_wait_ack(command_master, target_system, target_component, arm):
+    drain_messages(command_master)
+    param1 = 1 if arm else 0
+    label = "ARM" if arm else "DISARM"
+
+    log_event(
+        "INFO",
+        "COMMAND_SENT",
+        f"command=MAV_CMD_COMPONENT_ARM_DISARM param1={param1}",
+    )
+    command_master.mav.command_long_send(
+        target_system,
+        target_component,
+        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+        0,
+        param1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    )
+
+    return wait_for_command_ack(
+        command_master,
+        target_system,
+        target_component,
+        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+        label,
+    )
+
+
+def wait_for_armed_state(
+    command_master,
+    target_system,
+    target_component,
+    expected_armed,
+    timeout,
+    success_event,
+):
+    deadline = monotonic_time() + timeout
+    expected_label = "ARMED" if expected_armed else "DISARMED"
+
+    while monotonic_time() < deadline:
+        message = command_master.recv_match(blocking=True, timeout=CHECK_INTERVAL)
+        if message is None:
+            continue
+
+        if (
+            message.get_type() == "GLOBAL_POSITION_INT"
+            and message.get_srcSystem() == target_system
+        ):
+            update_status_from_global_position(STATUS, message)
+            continue
+
+        if is_relevant_heartbeat(message, target_system, target_component):
+            update_status_from_heartbeat(STATUS, message, STATUS["link_state"])
+            if STATUS["armed_state"] == expected_label:
+                log_event(
+                    "INFO",
+                    success_event,
+                    f"armed_state={STATUS['armed_state']}",
+                )
+                return True
+
+    log_event(
+        "WARN",
+        "ARMED_STATE_NOT_CONFIRMED",
+        f"expected={expected_label} timeout={timeout:.1f}",
+    )
+    return False
+
+
+def send_takeoff_and_wait_ack(command_master, target_system, target_component):
+    drain_messages(command_master)
+
+    log_event(
+        "INFO",
+        "COMMAND_SENT",
+        f"command=MAV_CMD_NAV_TAKEOFF alt={TAKEOFF_ALTITUDE_M:.1f}",
+    )
+    command_master.mav.command_long_send(
+        target_system,
+        target_component,
+        mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        TAKEOFF_ALTITUDE_M,
+    )
+
+    return wait_for_command_ack(
+        command_master,
+        target_system,
+        target_component,
+        mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+        "TAKEOFF",
+    )
+
+
+def wait_for_takeoff_altitude(command_master, target_system, target_component, start_altitude):
+    deadline = monotonic_time() + TAKEOFF_STATE_TIMEOUT
+    target_altitude = start_altitude + TAKEOFF_MIN_CLIMB_M
+
+    while monotonic_time() < deadline:
+        message = command_master.recv_match(blocking=True, timeout=CHECK_INTERVAL)
+        if message is None:
+            continue
+
+        if (
+            message.get_type() == "GLOBAL_POSITION_INT"
+            and message.get_srcSystem() == target_system
+        ):
+            update_status_from_global_position(STATUS, message)
+            if STATUS["current_altitude"] is not None:
+                if STATUS["current_altitude"] >= target_altitude:
+                    log_event(
+                        "INFO",
+                        "TAKEOFF_CONFIRMED",
+                        (
+                            f"alt={STATUS['current_altitude']:.2f} "
+                            f"target={target_altitude:.2f}"
+                        ),
+                    )
+                    return True
+            continue
+
+        if is_relevant_heartbeat(message, target_system, target_component):
+            update_status_from_heartbeat(STATUS, message, STATUS["link_state"])
+
+    log_event(
+        "WARN",
+        "TAKEOFF_NOT_CONFIRMED",
+        f"target_alt={target_altitude:.2f} timeout={TAKEOFF_STATE_TIMEOUT:.1f}",
+    )
+    return False
+
+
+def precheck_arm():
+    if STATUS["armed_state"] == "ARMED":
+        log_precheck_failed("ARM", "already_armed")
+        return False
+    return True
+
+
+def precheck_disarm(command_master, target_system, target_component):
+    if STATUS["armed_state"] == "DISARMED":
+        log_precheck_failed("DISARM", "already_disarmed")
+        return False
+
+    altitude = ensure_current_altitude(command_master, target_system, target_component)
+    if altitude is None:
+        log_precheck_failed("DISARM", "altitude_unknown")
+        return False
+
+    if altitude > DISARM_MAX_ALTITUDE_M:
+        log_precheck_failed(
+            "DISARM",
+            f"altitude_too_high alt={altitude:.2f}",
+        )
+        return False
+
+    return True
+
+
+def precheck_takeoff(command_master, target_system, target_component):
+    if STATUS["armed_state"] != "ARMED":
+        log_precheck_failed("TAKEOFF", "not_armed")
+        return False, None
+
+    if not is_guided_mode(STATUS["current_mode"]):
+        log_precheck_failed(
+            "TAKEOFF",
+            f"mode_not_guided mode={STATUS['current_mode']}",
+        )
+        return False, None
+
+    altitude = ensure_current_altitude(command_master, target_system, target_component)
+    if altitude is None:
+        log_precheck_failed("TAKEOFF", "altitude_unknown")
+        return False, None
+
+    if altitude > TAKEOFF_MAX_START_ALT_M:
+        log_precheck_failed(
+            "TAKEOFF",
+            f"already_airborne alt={altitude:.2f}",
+        )
+        return False, None
+
+    return True, altitude
+
+
+def send_arm_and_confirm(command_master, target_system, target_component):
+    if not precheck_arm():
+        return False
+
+    ack_ok = send_arm_disarm_and_wait_ack(
+        command_master,
+        target_system,
+        target_component,
+        True,
+    )
+    if not ack_ok:
+        return False
+
+    return wait_for_armed_state(
+        command_master,
+        target_system,
+        target_component,
+        True,
+        ARM_DISARM_STATE_TIMEOUT,
+        "ARM_CONFIRMED",
+    )
+
+
+def send_disarm_and_confirm(command_master, target_system, target_component):
+    if not precheck_disarm(command_master, target_system, target_component):
+        return False
+
+    ack_ok = send_arm_disarm_and_wait_ack(
+        command_master,
+        target_system,
+        target_component,
+        False,
+    )
+    if not ack_ok:
+        return False
+
+    return wait_for_armed_state(
+        command_master,
+        target_system,
+        target_component,
+        False,
+        ARM_DISARM_STATE_TIMEOUT,
+        "DISARM_CONFIRMED",
+    )
+
+
+def send_takeoff_and_confirm(command_master, target_system, target_component):
+    ok, start_altitude = precheck_takeoff(
+        command_master,
+        target_system,
+        target_component,
+    )
+    if not ok:
+        return False
+
+    ack_ok = send_takeoff_and_wait_ack(
+        command_master,
+        target_system,
+        target_component,
+    )
+    if not ack_ok:
+        return False
+
+    return wait_for_takeoff_altitude(
+        command_master,
+        target_system,
+        target_component,
+        start_altitude,
+    )
+
+
 def send_guided_hold_target(command_master, target_system, target_component, hold_target):
     command_master.mav.set_position_target_global_int_send(
         0,
@@ -664,6 +967,30 @@ def execute_emergency_action(
 
     if action == "land":
         action_ok = send_land_and_wait_ack(
+            command_master,
+            target_system,
+            target_component,
+        )
+        return action_ok, False, None
+
+    if action == "arm":
+        action_ok = send_arm_and_confirm(
+            command_master,
+            target_system,
+            target_component,
+        )
+        return action_ok, False, None
+
+    if action == "disarm":
+        action_ok = send_disarm_and_confirm(
+            command_master,
+            target_system,
+            target_component,
+        )
+        return action_ok, False, None
+
+    if action == "takeoff":
+        action_ok = send_takeoff_and_confirm(
             command_master,
             target_system,
             target_component,
