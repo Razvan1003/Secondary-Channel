@@ -1,3 +1,4 @@
+import math
 import os
 import sys
 import time
@@ -36,6 +37,14 @@ TAKEOFF_ALTITUDE_M = 5.0
 TAKEOFF_MIN_CLIMB_M = 0.8
 TAKEOFF_MAX_START_ALT_M = 0.5
 DISARM_MAX_ALTITUDE_M = 0.5
+CONTROLLED_FLIGHT_MIN_ALT_M = 0.8
+YAW_STEP_DEG = 15.0
+YAW_RATE_DEG_S = 15.0
+YAW_EFFECT_TIMEOUT = 3.0
+YAW_EFFECT_MIN_DEG = 5.0
+MOVE_STEP_METERS = 1.0
+MOVE_EFFECT_TIMEOUT = 4.0
+MOVE_EFFECT_MIN_METERS = 0.3
 ACTION_CHOICES = {
     "r": "rtl",
     "h": "hold",
@@ -43,13 +52,17 @@ ACTION_CHOICES = {
     "a": "arm",
     "d": "disarm",
     "t": "takeoff",
+    "j": "yaw_left",
+    "k": "yaw_right",
+    "f": "move_forward",
+    "n": "move_left",
     "q": "quit",
 }
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE_PATH = os.path.join(
     SCRIPT_DIR,
-    f"secondary_channel_v3_2_log_{time.strftime('%Y%m%d_%H%M%S')}.txt",
+    f"secondary_channel_v3_3_log_{time.strftime('%Y%m%d_%H%M%S')}.txt",
 )
 
 STATUS = {
@@ -198,6 +211,38 @@ def heading_radians_from_global_position(message):
     if message is None or getattr(message, "hdg", 65535) == 65535:
         return None
     return (message.hdg / 100.0) * 3.141592653589793 / 180.0
+
+
+def heading_degrees_from_global_position(message):
+    if message is None or getattr(message, "hdg", 65535) == 65535:
+        return None
+    return message.hdg / 100.0
+
+
+def normalize_heading_delta(delta_deg):
+    while delta_deg > 180.0:
+        delta_deg -= 360.0
+    while delta_deg < -180.0:
+        delta_deg += 360.0
+    return delta_deg
+
+
+def horizontal_distance_meters(lat1_int, lon1_int, lat2_int, lon2_int):
+    lat1 = lat1_int / 1e7
+    lon1 = lon1_int / 1e7
+    lat2 = lat2_int / 1e7
+    lon2 = lon2_int / 1e7
+
+    lat1_rad = math.radians(lat1)
+    lat2_rad = math.radians(lat2)
+    dlat = lat2_rad - lat1_rad
+    dlon = math.radians(lon2 - lon1)
+    mean_lat = (lat1_rad + lat2_rad) / 2.0
+    earth_radius_m = 6371000.0
+
+    x = dlon * math.cos(mean_lat)
+    y = dlat
+    return math.hypot(x, y) * earth_radius_m
 
 
 def current_hold_target_from_global_position(global_position):
@@ -364,7 +409,7 @@ def select_emergency_action():
     log_event(
         "INFO",
         "ACTION_MENU_SHOWN",
-        "options=RTL,HOLD,LAND,ARM,DISARM,TAKEOFF,QUIT",
+        "options=RTL,HOLD,LAND,ARM,DISARM,TAKEOFF,YAW_LEFT,YAW_RIGHT,MOVE_FORWARD,MOVE_LEFT,QUIT",
     )
     print()
     print("Select emergency action:")
@@ -374,10 +419,14 @@ def select_emergency_action():
     print("  a = ARM")
     print("  d = DISARM")
     print("  t = TAKEOFF")
+    print("  j = YAW LEFT")
+    print("  k = YAW RIGHT")
+    print("  f = MOVE FORWARD")
+    print("  n = MOVE LEFT")
     print("  q = monitor only / exit command loop")
 
     while True:
-        choice = input("Enter your choice (r/h/l/a/d/t/q): ").strip().lower()
+        choice = input("Enter your choice (r/h/l/a/d/t/j/k/f/n/q): ").strip().lower()
         action = ACTION_CHOICES.get(choice)
 
         if action is None:
@@ -386,7 +435,7 @@ def select_emergency_action():
                 "COMMAND_REJECTED_IF_INVALID",
                 f"choice={choice or '<empty>'}",
             )
-            print("Invalid choice. Use r, h, l, a, d, t or q.")
+            print("Invalid choice. Use r, h, l, a, d, t, j, k, f, n or q.")
             continue
 
         log_event("INFO", "ACTION_SELECTED", f"action={action.upper()}")
@@ -817,6 +866,42 @@ def precheck_takeoff(command_master, target_system, target_component):
     return True, altitude
 
 
+def precheck_guided_in_air(action, command_master, target_system, target_component):
+    if STATUS["armed_state"] != "ARMED":
+        log_precheck_failed(action, "not_armed")
+        return False, None
+
+    if not is_guided_mode(STATUS["current_mode"]):
+        log_precheck_failed(
+            action,
+            f"mode_not_guided mode={STATUS['current_mode']}",
+        )
+        return False, None
+
+    global_position = capture_current_position(
+        command_master,
+        target_system,
+        target_component,
+    )
+    if global_position is None:
+        log_precheck_failed(action, "position_unavailable")
+        return False, None
+
+    altitude = STATUS["current_altitude"]
+    if altitude is None:
+        log_precheck_failed(action, "altitude_unknown")
+        return False, None
+
+    if altitude < CONTROLLED_FLIGHT_MIN_ALT_M:
+        log_precheck_failed(
+            action,
+            f"not_safely_airborne alt={altitude:.2f}",
+        )
+        return False, None
+
+    return True, global_position
+
+
 def send_arm_and_confirm(command_master, target_system, target_component):
     if not precheck_arm():
         return False
@@ -886,6 +971,336 @@ def send_takeoff_and_confirm(command_master, target_system, target_component):
         target_component,
         start_altitude,
     )
+
+
+def send_yaw_command_and_wait_ack(
+    command_master,
+    target_system,
+    target_component,
+    angle_deg,
+    direction,
+    label,
+):
+    drain_messages(command_master)
+
+    log_event(
+        "INFO",
+        "YAW_COMMAND_SENT",
+        f"direction={label} angle_deg={angle_deg:.1f} relative=true",
+    )
+    log_event(
+        "INFO",
+        "COMMAND_SENT",
+        f"command=MAV_CMD_CONDITION_YAW direction={label} angle_deg={angle_deg:.1f}",
+    )
+    command_master.mav.command_long_send(
+        target_system,
+        target_component,
+        mavutil.mavlink.MAV_CMD_CONDITION_YAW,
+        0,
+        angle_deg,
+        YAW_RATE_DEG_S,
+        direction,
+        1,
+        0,
+        0,
+        0,
+        0,
+    )
+
+    return wait_for_command_ack(
+        command_master,
+        target_system,
+        target_component,
+        mavutil.mavlink.MAV_CMD_CONDITION_YAW,
+        f"CONDITION_YAW_{label.upper()}",
+    )
+
+
+def observe_yaw_effect(
+    command_master,
+    target_system,
+    target_component,
+    start_heading_deg,
+    label,
+):
+    if start_heading_deg is None:
+        log_event(
+            "WARN",
+            "YAW_EFFECT_NOT_OBSERVED",
+            f"direction={label} reason=heading_unavailable",
+        )
+        return False
+
+    deadline = monotonic_time() + YAW_EFFECT_TIMEOUT
+
+    while monotonic_time() < deadline:
+        message = command_master.recv_match(blocking=True, timeout=CHECK_INTERVAL)
+        if message is None:
+            continue
+
+        if (
+            message.get_type() == "GLOBAL_POSITION_INT"
+            and message.get_srcSystem() == target_system
+        ):
+            update_status_from_global_position(STATUS, message)
+            current_heading_deg = heading_degrees_from_global_position(message)
+            if current_heading_deg is None:
+                continue
+
+            delta_deg = normalize_heading_delta(current_heading_deg - start_heading_deg)
+            if label == "left" and delta_deg <= -YAW_EFFECT_MIN_DEG:
+                log_event(
+                    "INFO",
+                    "YAW_EFFECT_OBSERVED",
+                    f"direction={label} delta_deg={delta_deg:.1f} heading={current_heading_deg:.1f}",
+                )
+                return True
+            if label == "right" and delta_deg >= YAW_EFFECT_MIN_DEG:
+                log_event(
+                    "INFO",
+                    "YAW_EFFECT_OBSERVED",
+                    f"direction={label} delta_deg={delta_deg:.1f} heading={current_heading_deg:.1f}",
+                )
+                return True
+            continue
+
+        if is_relevant_heartbeat(message, target_system, target_component):
+            update_status_from_heartbeat(STATUS, message, STATUS["link_state"])
+
+    log_event(
+        "WARN",
+        "YAW_EFFECT_NOT_OBSERVED",
+        f"direction={label} timeout={YAW_EFFECT_TIMEOUT:.1f}",
+    )
+    return False
+
+
+def send_move_command(
+    command_master,
+    target_system,
+    target_component,
+    x_m,
+    y_m,
+    label,
+):
+    type_mask = (
+        mavutil.mavlink.POSITION_TARGET_TYPEMASK_VX_IGNORE
+        | mavutil.mavlink.POSITION_TARGET_TYPEMASK_VY_IGNORE
+        | mavutil.mavlink.POSITION_TARGET_TYPEMASK_VZ_IGNORE
+        | mavutil.mavlink.POSITION_TARGET_TYPEMASK_AX_IGNORE
+        | mavutil.mavlink.POSITION_TARGET_TYPEMASK_AY_IGNORE
+        | mavutil.mavlink.POSITION_TARGET_TYPEMASK_AZ_IGNORE
+        | mavutil.mavlink.POSITION_TARGET_TYPEMASK_YAW_IGNORE
+        | mavutil.mavlink.POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE
+    )
+
+    log_event(
+        "INFO",
+        "MOVE_COMMAND_SENT",
+        f"direction={label} distance_m={MOVE_STEP_METERS:.2f}",
+    )
+    log_event(
+        "INFO",
+        "COMMAND_SENT",
+        (
+            "command=SET_POSITION_TARGET_LOCAL_NED "
+            f"frame=BODY_OFFSET_NED x={x_m:.2f} y={y_m:.2f} z=0.00"
+        ),
+    )
+    command_master.mav.set_position_target_local_ned_send(
+        0,
+        target_system,
+        target_component,
+        mavutil.mavlink.MAV_FRAME_BODY_OFFSET_NED,
+        type_mask,
+        x_m,
+        y_m,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+    )
+
+
+def observe_movement_effect(
+    command_master,
+    target_system,
+    target_component,
+    start_global_position,
+    label,
+):
+    if start_global_position is None:
+        log_event(
+            "WARN",
+            "MOVEMENT_EFFECT_NOT_OBSERVED",
+            f"action={label} reason=position_unavailable",
+        )
+        return False
+
+    deadline = monotonic_time() + MOVE_EFFECT_TIMEOUT
+    start_lat_int = start_global_position.lat
+    start_lon_int = start_global_position.lon
+
+    while monotonic_time() < deadline:
+        message = command_master.recv_match(blocking=True, timeout=CHECK_INTERVAL)
+        if message is None:
+            continue
+
+        if (
+            message.get_type() == "GLOBAL_POSITION_INT"
+            and message.get_srcSystem() == target_system
+        ):
+            update_status_from_global_position(STATUS, message)
+            distance_m = horizontal_distance_meters(
+                start_lat_int,
+                start_lon_int,
+                message.lat,
+                message.lon,
+            )
+            if distance_m >= MOVE_EFFECT_MIN_METERS:
+                log_event(
+                    "INFO",
+                    "MOVEMENT_EFFECT_OBSERVED",
+                    f"action={label} distance_m={distance_m:.2f}",
+                )
+                return True
+            continue
+
+        if is_relevant_heartbeat(message, target_system, target_component):
+            update_status_from_heartbeat(STATUS, message, STATUS["link_state"])
+
+    log_event(
+        "WARN",
+        "MOVEMENT_EFFECT_NOT_OBSERVED",
+        f"action={label} timeout={MOVE_EFFECT_TIMEOUT:.1f}",
+    )
+    return False
+
+
+def send_yaw_left(command_master, target_system, target_component):
+    ok, global_position = precheck_guided_in_air(
+        "YAW_LEFT",
+        command_master,
+        target_system,
+        target_component,
+    )
+    if not ok:
+        return False
+
+    start_heading_deg = heading_degrees_from_global_position(global_position)
+    ack_ok = send_yaw_command_and_wait_ack(
+        command_master,
+        target_system,
+        target_component,
+        YAW_STEP_DEG,
+        -1,
+        "left",
+    )
+    if not ack_ok:
+        return False
+
+    observe_yaw_effect(
+        command_master,
+        target_system,
+        target_component,
+        start_heading_deg,
+        "left",
+    )
+    return True
+
+
+def send_yaw_right(command_master, target_system, target_component):
+    ok, global_position = precheck_guided_in_air(
+        "YAW_RIGHT",
+        command_master,
+        target_system,
+        target_component,
+    )
+    if not ok:
+        return False
+
+    start_heading_deg = heading_degrees_from_global_position(global_position)
+    ack_ok = send_yaw_command_and_wait_ack(
+        command_master,
+        target_system,
+        target_component,
+        YAW_STEP_DEG,
+        1,
+        "right",
+    )
+    if not ack_ok:
+        return False
+
+    observe_yaw_effect(
+        command_master,
+        target_system,
+        target_component,
+        start_heading_deg,
+        "right",
+    )
+    return True
+
+
+def send_move_forward(command_master, target_system, target_component):
+    ok, global_position = precheck_guided_in_air(
+        "MOVE_FORWARD",
+        command_master,
+        target_system,
+        target_component,
+    )
+    if not ok:
+        return False
+
+    send_move_command(
+        command_master,
+        target_system,
+        target_component,
+        MOVE_STEP_METERS,
+        0.0,
+        "forward",
+    )
+    observe_movement_effect(
+        command_master,
+        target_system,
+        target_component,
+        global_position,
+        "MOVE_FORWARD",
+    )
+    return True
+
+
+def send_move_left(command_master, target_system, target_component):
+    ok, global_position = precheck_guided_in_air(
+        "MOVE_LEFT",
+        command_master,
+        target_system,
+        target_component,
+    )
+    if not ok:
+        return False
+
+    send_move_command(
+        command_master,
+        target_system,
+        target_component,
+        0.0,
+        -MOVE_STEP_METERS,
+        "left",
+    )
+    observe_movement_effect(
+        command_master,
+        target_system,
+        target_component,
+        global_position,
+        "MOVE_LEFT",
+    )
+    return True
 
 
 def send_guided_hold_target(command_master, target_system, target_component, hold_target):
@@ -1017,6 +1432,38 @@ def execute_emergency_action(
 
     if action == "takeoff":
         action_ok = send_takeoff_and_confirm(
+            command_master,
+            target_system,
+            target_component,
+        )
+        return action_ok, False, None
+
+    if action == "yaw_left":
+        action_ok = send_yaw_left(
+            command_master,
+            target_system,
+            target_component,
+        )
+        return action_ok, False, None
+
+    if action == "yaw_right":
+        action_ok = send_yaw_right(
+            command_master,
+            target_system,
+            target_component,
+        )
+        return action_ok, False, None
+
+    if action == "move_forward":
+        action_ok = send_move_forward(
+            command_master,
+            target_system,
+            target_component,
+        )
+        return action_ok, False, None
+
+    if action == "move_left":
+        action_ok = send_move_left(
             command_master,
             target_system,
             target_component,
