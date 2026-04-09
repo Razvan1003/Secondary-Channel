@@ -6,6 +6,120 @@ Acest repository contine scripturi Python separate, realizate pentru un
 proiect de licenta. Scripturile sunt folosite pentru validarea incrementala a
 unui canal secundar de siguranta in simulare, fara integrare hardware reala.
 
+## Desktop orchestration MVP
+
+Repository-ul include acum si un MVP desktop pentru Windows, construit cu
+`PySide6`, care orchestreaza workflow-ul validat fara a muta logica MAVLink din
+`secondary_channel_v4.py`.
+
+Fisierele aplicatiei:
+
+- `app.py`
+- `main_window.py`
+- `process_manager.py`
+- `config.py`
+- `commands.py`
+- `widgets/log_panel.py`
+- `widgets/status_panel.py`
+
+### Ce face aplicatia
+
+- porneste `ArduPilot SITL` in WSL
+- porneste `secondary_channel_v4.py` in Windows
+- ruleaza comenzile PowerShell pentru failover / restore
+- afiseaza stdout/stderr pentru SITL si pentru canalul secundar
+- parseaza simplu logurile din `secondary_channel_v4.py` pentru:
+  - monitor status
+  - command status
+  - trust status
+  - mode
+  - armed
+  - altitude
+
+### Rulare
+
+Cerinte suplimentare:
+
+- Python 3
+- `PySide6`
+- `pymavlink`
+- WSL configurat pentru ArduPilot
+
+Instalare:
+
+```bash
+pip install PySide6 pymavlink
+```
+
+Pornire aplicatie:
+
+```bash
+py app.py
+```
+
+### Configurare MVP
+
+Configuratia centralizata este in `config.py`.
+
+Valori importante:
+
+- calea WSL catre `ArduPilot`: `ARDUPILOT_WSL_PATH`
+- IP-ul Windows host folosit de SITL pentru `14550` si `14560`:
+  `SECONDARY_WINDOWS_HOST_IP`
+- hostul pentru conexiunea TCP a command path-ului:
+  `SECONDARY_COMMAND_HOST`
+- cheia de signing:
+  `SECONDARY_CHANNEL_SIGNING_KEY`
+- calea optionala catre Mission Planner:
+  `MISSION_PLANNER_PATH`
+
+### Comenzile exacte folosite de aplicatie
+
+Pornire SITL in WSL:
+
+```bash
+wsl.exe -- bash -lc "cd ~/ardupilot/ArduCopter && sim_vehicle.py -w -v ArduCopter -f quad --map --console --out=<WIN_HOST_IP>:14550 --out=<WIN_HOST_IP>:14560 -A \"--serial2=tcp:5782\""
+```
+
+Pornire canal secundar in Windows:
+
+```bash
+py .\secondary_channel_v4.py
+```
+
+cu variabilele de mediu:
+
+- `SECONDARY_CHANNEL_MONITOR_CONNECTION=udpin:0.0.0.0:14560`
+- `SECONDARY_CHANNEL_COMMAND_CONNECTION=tcp:<COMMAND_HOST>:5782`
+- `SECONDARY_CHANNEL_SIGNING_ENABLED=...`
+- `SECONDARY_CHANNEL_MONITOR_SIGNING_ENABLED=...`
+- `SECONDARY_CHANNEL_COMMAND_SIGNING_ENABLED=...`
+- `SECONDARY_CHANNEL_SIGNING_KEY=...`
+- `SECONDARY_CHANNEL_COMMAND_UNSIGNED_POLICY=...`
+- `SECONDARY_CHANNEL_SECURITY_TEST_MODE=...`
+
+Blocare failover:
+
+```powershell
+Remove-NetFirewallRule -DisplayName "Block_MAVLink_14560_Test" -ErrorAction SilentlyContinue
+New-NetFirewallRule -DisplayName "Block_MAVLink_14560_Test" -Direction Inbound -Action Block -Protocol UDP -LocalPort 14560 -Profile Any
+```
+
+Restore link:
+
+```powershell
+Remove-NetFirewallRule -DisplayName "Block_MAVLink_14560_Test" -ErrorAction SilentlyContinue
+```
+
+### Limitari curente ale aplicatiei desktop
+
+- foloseste in continuare WSL in backend pentru `sim_vehicle.py`
+- foloseste in continuare PowerShell pentru simularea failover-ului
+- foloseste `secondary_channel_v4.py` ca nucleu operational, fara a muta
+  signing-ul sau logica de trust in UI
+- parserul de status este intentionat simplu si bazat pe stdout, pentru a
+  pastra MVP-ul usor de extins
+
 ## Scop
 
 Scopul proiectului este demonstratia unei logici simple pentru un canal
