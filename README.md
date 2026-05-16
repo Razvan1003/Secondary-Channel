@@ -1,576 +1,138 @@
-# Secondary-Channel
+# UAV Emergency Communication - Secondary Channel
 
-Canal secundar de urgenta pentru o drona bazata pe MAVLink.
+Python-based secondary safety channel for UAV emergency communication experiments using MAVLink and ArduPilot SITL.
 
-Acest repository contine scripturi Python separate, realizate pentru un
-proiect de licenta. Scripturile sunt folosite pentru validarea incrementala a
-unui canal secundar de siguranta in simulare, fara integrare hardware reala.
+The project validates how a separate software channel can monitor a UAV link, detect loss of communication and trigger emergency actions in simulation.
 
-## Desktop orchestration MVP
+## What It Does
 
-Repository-ul include acum si un MVP desktop pentru Windows, construit cu
-`PySide6`, care orchestreaza workflow-ul validat fara a muta logica MAVLink din
-`secondary_channel_v4.py`.
+- Monitors MAVLink heartbeat and telemetry over a dedicated UDP endpoint
+- Detects primary-link loss using timeout-based monitoring
+- Sends emergency actions through a separate command path
+- Supports RTL, LAND, GUIDED HOLD, ARM/DISARM, TAKEOFF and altitude-change workflows
+- Logs operational events, command acknowledgements and observed vehicle state
+- Includes optional MAVLink 2 signing configuration for security-oriented testing
+- Provides a PySide6 desktop orchestrator for Windows-based lab runs
 
-Fisierele aplicatiei:
+## Architecture
 
-- `app.py`
-- `main_window.py`
-- `process_manager.py`
-- `config.py`
-- `commands.py`
-- `widgets/log_panel.py`
-- `widgets/status_panel.py`
+```text
+ArduPilot SITL / MAVProxy
+        |
+        | UDP 14550
+        v
+Mission Planner
 
-### Ce face aplicatia
+ArduPilot SITL / MAVProxy
+        |
+        | UDP 14560
+        v
+Secondary monitor path
 
-- porneste `ArduPilot SITL` in WSL
-- porneste `secondary_channel_v4.py` in Windows
-- ruleaza comenzile PowerShell pentru failover / restore
-- afiseaza stdout/stderr pentru SITL si pentru canalul secundar
-- parseaza simplu logurile din `secondary_channel_v4.py` pentru:
-  - monitor status
-  - command status
-  - trust status
-  - mode
-  - armed
-  - altitude
-
-### Rulare
-
-Cerinte suplimentare:
-
-- Python 3
-- `PySide6`
-- `pymavlink`
-- WSL configurat pentru ArduPilot
-
-Instalare:
-
-```bash
-pip install PySide6 pymavlink
+Secondary channel script
+        |
+        | TCP command path
+        v
+ArduPilot command interface
 ```
 
-Pornire aplicatie:
+The desktop application starts and supervises the main lab components:
+
+- ArduPilot SITL through WSL
+- `secondary_channel_v4.py` on Windows
+- PowerShell failover and restore commands
+- optional Mission Planner launch
+- live stdout/stderr panels and parsed status values
+
+## Repository Structure
+
+```text
+app.py                    # PySide6 application entry point
+main_window.py            # desktop UI
+process_manager.py        # QProcess orchestration and log parsing
+commands.py               # command builders for SITL, failover and secondary script
+config.py                 # environment-based configuration
+secondary_channel_v4.py   # current main secondary-channel implementation
+secondary_channel_v*.py   # incremental experiment versions
+widgets/                  # UI panels
+docs/                     # architecture and validation notes
+```
+
+## Requirements
+
+- Windows
+- Python 3
+- WSL with ArduPilot SITL configured
+- Mission Planner, optional but recommended for visual validation
+- Python packages:
+  - `pymavlink`
+  - `PySide6`
+
+Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+## Quick Start
+
+Start the desktop orchestrator:
 
 ```bash
 py app.py
 ```
 
-### Configurare MVP
-
-Configuratia centralizata este in `config.py`.
-
-Valori importante:
-
-- calea WSL catre `ArduPilot`: `ARDUPILOT_WSL_PATH`
-- IP-ul Windows host folosit de SITL pentru `14550` si `14560`:
-  `SECONDARY_WINDOWS_HOST_IP`
-- hostul pentru conexiunea TCP a command path-ului:
-  `SECONDARY_COMMAND_HOST`
-- cheia de signing:
-  `SECONDARY_CHANNEL_SIGNING_KEY`
-- calea optionala catre Mission Planner:
-  `MISSION_PLANNER_PATH`
-
-### Comenzile exacte folosite de aplicatie
-
-Pornire SITL in WSL:
+Run the current secondary-channel script directly:
 
 ```bash
-wsl.exe -- bash -lc "cd ~/ardupilot/ArduCopter && sim_vehicle.py -w -v ArduCopter -f quad --map --console --out=<WIN_HOST_IP>:14550 --out=<WIN_HOST_IP>:14560 -A \"--serial2=tcp:5782\""
+py secondary_channel_v4.py
 ```
 
-Pornire canal secundar in Windows:
+Example SITL command:
 
 ```bash
-py .\secondary_channel_v4.py
+sim_vehicle.py -w -v ArduCopter -f quad --map --console --out=<WINDOWS_HOST_IP>:14550 --out=<WINDOWS_HOST_IP>:14560 -A "--serial2=tcp:5782"
 ```
 
-cu variabilele de mediu:
-
-- `SECONDARY_CHANNEL_MONITOR_CONNECTION=udpin:0.0.0.0:14560`
-- `SECONDARY_CHANNEL_COMMAND_CONNECTION=tcp:<COMMAND_HOST>:5782`
-- `SECONDARY_CHANNEL_SIGNING_ENABLED=...`
-- `SECONDARY_CHANNEL_MONITOR_SIGNING_ENABLED=...`
-- `SECONDARY_CHANNEL_COMMAND_SIGNING_ENABLED=...`
-- `SECONDARY_CHANNEL_SIGNING_KEY=...`
-- `SECONDARY_CHANNEL_COMMAND_UNSIGNED_POLICY=...`
-- `SECONDARY_CHANNEL_SECURITY_TEST_MODE=...`
-
-Blocare failover:
-
-```powershell
-Remove-NetFirewallRule -DisplayName "Block_MAVLink_14560_Test" -ErrorAction SilentlyContinue
-New-NetFirewallRule -DisplayName "Block_MAVLink_14560_Test" -Direction Inbound -Action Block -Protocol UDP -LocalPort 14560 -Profile Any
-```
-
-Restore link:
-
-```powershell
-Remove-NetFirewallRule -DisplayName "Block_MAVLink_14560_Test" -ErrorAction SilentlyContinue
-```
-
-### Limitari curente ale aplicatiei desktop
-
-- foloseste in continuare WSL in backend pentru `sim_vehicle.py`
-- foloseste in continuare PowerShell pentru simularea failover-ului
-- foloseste `secondary_channel_v4.py` ca nucleu operational, fara a muta
-  signing-ul sau logica de trust in UI
-- parserul de status este intentionat simplu si bazat pe stdout, pentru a
-  pastra MVP-ul usor de extins
-
-## Scop
-
-Scopul proiectului este demonstratia unei logici simple pentru un canal
-secundar de siguranta:
-
-- monitorizare MAVLink
-- detectie de evenimente critice
-- activare a unei reactii de urgenta
-- validare experimentala in ArduPilot SITL
-
-## Versiuni incluse
-
-- `secondary_channel_v1.py`
-  - failover automat dupa pierderea heartbeat-ului
-  - activare logica secundara
-  - trimitere `RTL`
-  - verificare `COMMAND_ACK`
-- `secondary_channel_v2_1.py`
-  - activare manuala a canalului secundar
-  - mentinere a pozitiei si altitudinii curente
-  - implementare prin `GUIDED hold` pe baza pozitiei curente
-  - confirmare operationala in Mission Planner
-- `secondary_channel_v2_2.py`
-  - activare manuala a canalului secundar
-  - trimitere comanda `LAND`
-  - verificare `COMMAND_ACK`
-  - confirmare operationala in Mission Planner
-- `secondary_channel_v2_3.py`
-  - activare manuala combinata
-  - `GUIDED hold` prin tasta `h`
-  - `LAND` prin tasta `d`
-  - scenariu incremental hold apoi land
-- `secondary_channel_v2_4.py`
-  - failover automat configurabil
-  - monitorizare heartbeat cu timeout de 5 secunde
-  - reactie automata selectata din cod: `rtl`, `hold`, `land`
-  - `HOLD` cu fallback pe ultima pozitie cunoscuta de pe monitor link
-- `secondary_channel_v2_5.py`
-  - failover automat cu selectie la runtime dupa pierderea linkului
-  - meniul apare doar dupa `Primary link lost`
-  - optiuni: `r = RTL`, `h = HOLD`, `l = LAND`
-  - executie a reactiei alese fara editarea codului sursa
-- `secondary_channel_v3_1.py`
-  - pastreaza logica din `V2.5`
-  - adauga logging structurat in consola si in fisier `.txt`
-  - logheaza status minim: mod, stare armed/disarmed, altitudine, link state
-  - continua observatia pe `command link` dupa failover
-  - logheaza heartbeat, mod, altitudine si pozitie pe secondary
-
-## Arhitectura de test
-
-Scripturile au fost testate in simulare cu:
-
-`ArduPilot SITL -> MAVProxy -> Mission Planner`
-
-Endpoint-uri MAVLink folosite in test:
-
-- `14550` pentru Mission Planner
-- `14560` pentru scriptul Python al canalului secundar
-- `5762` pentru conexiunea separata de comanda folosita in V1, V2.4, V2.5 si V3.1
-
-Aceste porturi sunt endpoint-uri software de simulare, nu canale RF reale.
-
-## Cerinte
-
-- Python 3
-- `pymavlink`
-
-Instalare:
-
-```bash
-pip install pymavlink
-```
-
-## Configurare
-
-### V1
-
-Configuratia implicita din `secondary_channel_v1.py` este:
-
-```python
-MONITOR_CONNECTION = "udpin:0.0.0.0:14560"
-COMMAND_CONNECTION = "tcp:172.30.214.87:5762"
-HEARTBEAT_TIMEOUT = 5
-CHECK_INTERVAL = 0.2
-COMMAND_ACK_TIMEOUT = 3
-```
-
-Configuratia a fost folosita intr-un setup in care MAVProxy ruleaza in WSL,
-iar scriptul Python ruleaza pe Windows. Daca IP-ul din WSL se schimba, valoarea
-`COMMAND_CONNECTION` trebuie actualizata.
-
-### V2.1
-
-Configuratia implicita din `secondary_channel_v2_1.py` este:
-
-```python
-MAVLINK_CONNECTION = "udpin:0.0.0.0:14560"
-CHECK_INTERVAL = 0.2
-HOLD_SEND_INTERVAL = 0.5
-```
-
-### V2.2
-
-Configuratia implicita din `secondary_channel_v2_2.py` este:
-
-```python
-MAVLINK_CONNECTION = "udpin:0.0.0.0:14560"
-CHECK_INTERVAL = 0.2
-COMMAND_ACK_TIMEOUT = 3
-```
-
-### V2.3
-
-Configuratia implicita din `secondary_channel_v2_3.py` este:
-
-```python
-MAVLINK_CONNECTION = "udpin:0.0.0.0:14560"
-CHECK_INTERVAL = 0.2
-HOLD_SEND_INTERVAL = 0.5
-COMMAND_ACK_TIMEOUT = 3
-```
-
-### V2.4
-
-Configuratia implicita din `secondary_channel_v2_4.py` este:
-
-```python
-MONITOR_CONNECTION = "udpin:0.0.0.0:14560"
-COMMAND_CONNECTION = "tcp:172.30.214.87:5762"
-HEARTBEAT_TIMEOUT = 5
-CHECK_INTERVAL = 0.2
-COMMAND_ACK_TIMEOUT = 3
-HOLD_SEND_INTERVAL = 0.5
-POSITION_CAPTURE_TIMEOUT = 1.0
-EMERGENCY_ACTION = "land"
-```
-
-Reactia poate fi setata direct din cod la una dintre valorile:
-
-- `rtl`
-- `hold`
-- `land`
-
-### V2.5
-
-Configuratia implicita din `secondary_channel_v2_5.py` este:
-
-```python
-MONITOR_CONNECTION = "udpin:0.0.0.0:14560"
-COMMAND_CONNECTION = "tcp:172.30.214.87:5762"
-HEARTBEAT_TIMEOUT = 5
-CHECK_INTERVAL = 0.2
-COMMAND_ACK_TIMEOUT = 3
-HOLD_SEND_INTERVAL = 0.5
-POSITION_CAPTURE_TIMEOUT = 1.0
-```
-
-In V2.5, reactia nu mai este fixata in cod. Alegerea se face dupa pierderea
-heartbeat-ului, direct din consola:
-
-- `r = RTL`
-- `h = HOLD`
-- `l = LAND`
-
-### V3.1
-
-Configuratia implicita din `secondary_channel_v3_1.py` este:
-
-```python
-MONITOR_CONNECTION = "udpin:0.0.0.0:14560"
-COMMAND_CONNECTION = "tcp:172.30.214.87:5762"
-HEARTBEAT_TIMEOUT = 5
-CHECK_INTERVAL = 0.2
-COMMAND_ACK_TIMEOUT = 3
-HOLD_SEND_INTERVAL = 0.5
-POSITION_CAPTURE_TIMEOUT = 1.0
-GLOBAL_POSITION_INTERVAL_US = 500000
-SECONDARY_HEARTBEAT_TIMEOUT = 1.5
-SECONDARY_LOG_INTERVAL = 1.0
-SECONDARY_NO_HEARTBEAT_RELOG_INTERVAL = 5.0
-```
-
-In V3.1:
-
-- meniul de actiuni apare dupa pierderea heartbeat-ului
-- logul este afisat in consola si salvat in fisier `.txt`
-- dupa failover, scriptul continua sa observe `command link`
-- sunt logate:
-  - `HEARTBEAT_OK`
-  - `LINK_TIMEOUT`
-  - `SECONDARY_ACTIVATED`
-  - `ACTION_SELECTED`
-  - `COMMAND_ACK`
-  - `SECONDARY_HEARTBEAT_OK`
-  - `SECONDARY_MODE_OBSERVED`
-  - `SECONDARY_ALTITUDE_OBSERVED`
-  - `SECONDARY_POSITION_OBSERVED`
-
-## Rulare
-
-Pornire V1:
-
-```bash
-python secondary_channel_v1.py
-```
-
-Pornire V2.1:
-
-```bash
-python secondary_channel_v2_1.py
-```
-
-Pornire V2.2:
-
-```bash
-python secondary_channel_v2_2.py
-```
-
-Pornire V2.3:
-
-```bash
-python secondary_channel_v2_3.py
-```
-
-Pornire V2.4:
-
-```bash
-python secondary_channel_v2_4.py
-```
-
-Pornire V2.5:
-
-```bash
-python secondary_channel_v2_5.py
-```
-
-Pornire V3.1:
-
-```bash
-python secondary_channel_v3_1.py
-```
-
-Exemplu de pornire SITL:
-
-```bash
-sim_vehicle.py -v ArduCopter -f quad --map --console --out=172.30.208.1:14550 --out=172.30.208.1:14560
-```
-
-## Test rapid V1
-
-1. Se porneste simularea ArduPilot SITL.
-2. Se porneste Mission Planner pe `UDP 14550`.
-3. Se porneste scriptul Python V1.
-4. Vehiculul este trecut in `GUIDED`, armat si ridicat la 5 m.
-5. In MAVProxy se elimina doar output-ul monitorizat de script:
-   `output remove 172.30.208.1:14560`
-6. Scriptul trebuie sa afiseze:
-   - `Primary link lost`
-   - `Secondary channel activated`
-   - `RTL command sent. Waiting for COMMAND_ACK...`
-   - `COMMAND_ACK received for RTL: MAV_RESULT_ACCEPTED`
-7. Mission Planner trebuie sa indice trecerea in `RTL`.
-
-## Test rapid V2.1
-
-1. Se porneste simularea ArduPilot SITL.
-2. Se porneste Mission Planner pe `UDP 14550`.
-3. Se porneste scriptul `secondary_channel_v2_1.py`.
-4. Vehiculul este trecut in `GUIDED`, armat si ridicat la 5 m.
-5. In consola scriptului se apasa `h` sau `l`.
-6. Scriptul trebuie sa afiseze:
-   - `Manual secondary-channel activation requested`
-   - `Sending GUIDED hold target based on current position...`
-   - `GUIDED hold is active`
-7. Mission Planner trebuie sa arate ca vehiculul ramane in `GUIDED`
-   si mentine aproximativ pozitia si altitudinea curenta.
-
-## Test rapid V2.2
-
-1. Se porneste simularea ArduPilot SITL.
-2. Se porneste Mission Planner pe `UDP 14550`.
-3. Se porneste scriptul `secondary_channel_v2_2.py`.
-4. Vehiculul este trecut in `GUIDED`, armat si ridicat la 5 m.
-5. In consola scriptului se apasa `l` sau `d`.
-6. Scriptul trebuie sa afiseze:
-   - `Manual secondary-channel activation requested`
-   - `Sending LAND command...`
-   - `COMMAND_ACK received for LAND: MAV_RESULT_ACCEPTED`
-7. Mission Planner trebuie sa arate trecerea in `LAND`
-   si coborarea controlata spre sol.
-
-## Test rapid V2.3
-
-1. Se porneste simularea ArduPilot SITL.
-2. Se porneste Mission Planner pe `UDP 14550`.
-3. Se porneste scriptul `secondary_channel_v2_3.py`.
-4. Vehiculul este trecut in `GUIDED`, armat si ridicat la 5 m.
-5. In consola scriptului se apasa `h` pentru `GUIDED hold`.
-6. Se verifica mentinerea pozitiei si a altitudinii curente.
-7. In acelasi zbor, in consola scriptului se apasa `d` pentru `LAND`.
-8. Scriptul trebuie sa afiseze:
-   - activarea `GUIDED hold`
-   - apoi `Sending LAND command...`
-   - `COMMAND_ACK received for LAND: MAV_RESULT_ACCEPTED`
-9. Mission Planner trebuie sa arate mai intai mentinerea in `GUIDED`,
-   apoi trecerea in `LAND` si coborarea spre sol.
-
-## Test rapid V2.4
-
-1. Se porneste simularea ArduPilot SITL.
-2. Se porneste Mission Planner pe `UDP 14550`.
-3. Se porneste scriptul `secondary_channel_v2_4.py`.
-4. In cod se seteaza `EMERGENCY_ACTION` la `rtl`, `hold` sau `land`.
-5. Vehiculul este trecut in `GUIDED`, armat si ridicat la 5 m.
-6. In MAVProxy se elimina output-ul monitorizat de script:
-   `output remove 172.30.208.1:14560`
-7. Scriptul trebuie sa afiseze:
-   - `Primary link lost`
-   - `Secondary channel activated`
-   - apoi reactia configurata
-8. Pentru `rtl` si `land`, validarea se face prin `COMMAND_ACK` si observarea
-   modului in Mission Planner.
-9. Pentru `hold`, validarea este operationala: vehiculul ramane in `GUIDED`
-   si mentine aproximativ pozitia si altitudinea curenta.
-
-## Test rapid V2.5
-
-1. Se porneste simularea ArduPilot SITL.
-2. Se porneste Mission Planner pe `UDP 14550`.
-3. Se porneste scriptul `secondary_channel_v2_5.py`.
-4. Vehiculul este trecut in `GUIDED`, armat si ridicat la 5 m.
-5. In MAVProxy se elimina output-ul monitorizat de script:
-   `output remove 172.30.208.1:14560`
-6. Dupa timeout, scriptul trebuie sa afiseze:
-   - `Primary link lost`
-   - `Secondary channel activated`
-   - meniul cu `r = RTL`, `h = HOLD`, `l = LAND`
-7. Operatorul alege reactia direct in consola in acel moment.
-8. Scriptul executa reactia aleasa:
-   - `RTL` cu `COMMAND_ACK`
-   - `LAND` cu `COMMAND_ACK`
-   - `HOLD` prin `GUIDED hold`
-
-## Test rapid V3.1
-
-1. Se porneste simularea ArduPilot SITL.
-2. Se porneste Mission Planner pe `UDP 14550`.
-3. Se porneste scriptul `secondary_channel_v3_1.py`.
-4. Vehiculul este trecut in `GUIDED`, armat si ridicat la 5 m.
-5. In MAVProxy se elimina output-ul monitorizat de script:
-   `output remove 172.30.208.1:14560`
-6. Dupa timeout, scriptul trebuie sa afiseze:
-   - `LINK_TIMEOUT`
-   - `MONITOR_LINK_LOST`
-   - `SECONDARY_ACTIVATED`
-   - meniul cu `r = RTL`, `h = HOLD`, `l = LAND`
-7. Operatorul alege reactia direct in consola.
-8. Scriptul executa reactia si continua observatia pe `command link`.
-9. Pentru `RTL` si `LAND`, se verifica:
-   - `COMMAND_SENT`
-   - `COMMAND_ACK`
-   - `SECONDARY_MODE_OBSERVED`
-10. Pentru `HOLD`, se verifica:
-   - `POSITION_SOURCE`
-   - `HOLD_ACTIVE`
-   - `SECONDARY_HEARTBEAT_OK`
-   - `SECONDARY_ALTITUDE_OBSERVED`
-   - `SECONDARY_POSITION_OBSERVED`
-11. Se verifica si fisierul `.txt` generat in acelasi folder.
-
-## Limitari
-
-V1 nu include:
-
-- `LAND`
-- `HOLD`
-- comutare manuala
-- telemetrie avansata
-- GUI
-
-V2.1 nu include:
-
-- `LAND`
-- selectie multipla de comenzi
-- control complet roll/pitch/yaw
-- telemetrie complexa
-- hardware LoRa real
-
-V2.2 nu include:
-
-- selectie multipla de comenzi
-- control complet roll/pitch/yaw
-- telemetrie complexa
-- hardware LoRa real
-
-V2.3 nu include:
-
-- selectie avansata de comenzi
-- telemetrie complexa
-- control complet roll/pitch/yaw
-- hardware LoRa real
-
-V2.4 nu include:
-
-- selectie interactiva a reactiei
-- GUI
-- telemetrie complexa
-- control complet roll/pitch/yaw
-- hardware LoRa real
-
-V2.5 nu include:
-
-- GUI
-- selectie grafica
-- telemetrie complexa
-- control complet roll/pitch/yaw
-- hardware LoRa real
-
-V3.1 nu include:
-
-- GUI
-- telemetrie complexa
-- control complet roll/pitch/yaw
-- hardware LoRa real
-- monitorizare avansata pe termen lung
-
-In V2.1, `GUIDED hold` este implementat cu mesaje
-`SET_POSITION_TARGET_GLOBAL_INT`. Aceste mesaje nu intorc `COMMAND_ACK`, astfel
-ca validarea este operationala: vehiculul trebuie sa ramana in `GUIDED` si sa
-isi mentina aproximativ pozitia si altitudinea curenta.
-
-In V2.2, `LAND` este implementat cu `MAV_CMD_NAV_LAND`, astfel incat validarea
-se face atat prin `COMMAND_ACK`, cat si operational, prin observarea coborarii
-si a aterizarii in Mission Planner.
-
-In V2.3, aceeasi sesiune de test poate combina doua actiuni manuale:
-mai intai `GUIDED hold`, apoi `LAND`.
-
-## Rolul repository-ului
-
-Acest repository are rol didactic si de validare experimentala:
-
-- demonstreaza monitorizarea MAVLink dintr-un proces Python separat
-- demonstreaza un failover automat de tip `RTL`
-- demonstreaza o activare manuala de tip `GUIDED hold`
-- demonstreaza o activare manuala de tip `LAND`
-- demonstreaza un scenariu combinat `hold` urmat de `land`
-- demonstreaza un failover automat configurabil prin `rtl`, `hold` sau `land`
-- demonstreaza alegerea reactiei de urgenta dupa pierderea linkului, fara
-  editarea codului sursa
-- demonstreaza logging structurat in consola si in fisier `.txt`
-- demonstreaza observatia continua a secondary link-ului dupa failover
-- ofera o baza clara pentru etape viitoare mai complexe
+## Configuration
+
+The application reads configuration from environment variables through `config.py`.
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `ARDUPILOT_WSL_PATH` | ArduPilot path inside WSL | `~/ardupilot/ArduCopter` |
+| `SECONDARY_WINDOWS_HOST_IP` | Windows host IP used by SITL outputs | `172.30.208.1` |
+| `SECONDARY_MONITOR_UDP_PORT` | UDP port for monitor link | `14560` |
+| `MISSION_PLANNER_UDP_PORT` | UDP port for Mission Planner | `14550` |
+| `SECONDARY_COMMAND_HOST` | host for command path | `127.0.0.1` |
+| `SECONDARY_COMMAND_TCP_PORT` | TCP command port | `5782` |
+| `SECONDARY_CHANNEL_SIGNING_ENABLED` | enables MAVLink signing config | `false` in script |
+| `SECONDARY_CHANNEL_COMMAND_UNSIGNED_POLICY` | command unsigned-message policy | `reject` |
+
+Do not commit real signing keys or operational secrets.
+
+## Test Scenario
+
+1. Start ArduPilot SITL.
+2. Connect Mission Planner to UDP `14550`.
+3. Start the secondary-channel script or desktop orchestrator.
+4. Arm the vehicle in simulation and take off to a safe test altitude.
+5. Simulate monitor-link failure by blocking UDP `14560`.
+6. Confirm that the secondary channel detects link loss.
+7. Select or trigger an emergency action: RTL, LAND or HOLD.
+8. Validate the result through command acknowledgements, logs and Mission Planner state.
+
+## Current Limitations
+
+- Simulation-only project; no real RF or LoRa hardware is integrated
+- Not flight-certified and not intended for real aircraft operation
+- Failover is validated in ArduPilot SITL, not in a physical UAV environment
+- Some status parsing is based on process output and should be replaced with structured telemetry for a production-grade tool
+
+## Roadmap
+
+- Add a clean architecture diagram under `docs/`
+- Add repeatable test logs and screenshots
+- Move older experiment versions into a dedicated `experiments/` directory
+- Add basic lint/compile checks
+- Document MAVLink signing test cases more explicitly

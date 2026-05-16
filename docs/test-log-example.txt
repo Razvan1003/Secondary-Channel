@@ -1,0 +1,5 @@
+[12:00:01] INFO  MONITOR_CONNECTED        endpoint=udpin:0.0.0.0:14560 | mode=GUIDED armed=ARMED alt=5.00m link=MONITOR_OK
+[12:00:06] WARN  LINK_TIMEOUT             heartbeat_timeout=5.0s | mode=GUIDED armed=ARMED alt=5.02m link=MONITOR_LOST
+[12:00:06] INFO  SECONDARY_ACTIVATED      action_menu=enabled | mode=GUIDED armed=ARMED alt=5.02m link=SECONDARY_ACTIVE
+[12:00:09] INFO  ACTION_SELECTED          action=rtl | mode=GUIDED armed=ARMED alt=5.02m link=SECONDARY_ACTIVE
+[12:00:10] INFO  COMMAND_ACK              command=RTL result=MAV_RESULT_ACCEPTED | mode=RTL armed=ARMED alt=5.01m link=COMMAND_OK
