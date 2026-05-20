@@ -20,6 +20,7 @@ class SigningConfig:
 
 @dataclass(frozen=True)
 class AppConfig:
+    hardware_mode: bool
     wsl_executable: str
     powershell_executable: str
     python_launcher: str
@@ -31,6 +32,10 @@ class AppConfig:
     mission_planner_udp_port: int
     monitor_udp_port: int
     command_tcp_port: int
+    monitor_serial_port: str
+    monitor_serial_baud: int
+    command_serial_port: str
+    command_serial_baud: int
     firewall_rule_name: str
     secondary_script_path: Path
     secondary_workdir: Path
@@ -45,7 +50,8 @@ def _env_flag(name: str, default: bool) -> bool:
 
 
 def load_config() -> AppConfig:
-    signing_enabled = _env_flag("SECONDARY_CHANNEL_SIGNING_ENABLED", True)
+    hardware_mode = _env_flag("SECONDARY_HARDWARE_MODE", False)
+    signing_enabled = _env_flag("SECONDARY_CHANNEL_SIGNING_ENABLED", False)
     signing = SigningConfig(
         signing_enabled=signing_enabled,
         monitor_signing_enabled=_env_flag(
@@ -79,6 +85,7 @@ def load_config() -> AppConfig:
         )
     ).expanduser()
     return AppConfig(
+        hardware_mode=hardware_mode,
         wsl_executable=os.environ.get("WSL_EXECUTABLE", "wsl.exe").strip(),
         powershell_executable=os.environ.get(
             "POWERSHELL_EXECUTABLE",
@@ -107,6 +114,20 @@ def load_config() -> AppConfig:
         ),
         command_tcp_port=int(
             os.environ.get("SECONDARY_COMMAND_TCP_PORT", "5782").strip()
+        ),
+        monitor_serial_port=os.environ.get(
+            "SECONDARY_MONITOR_SERIAL_PORT",
+            "COM7",
+        ).strip(),
+        monitor_serial_baud=int(
+            os.environ.get("SECONDARY_MONITOR_SERIAL_BAUD", "921600").strip()
+        ),
+        command_serial_port=os.environ.get(
+            "SECONDARY_COMMAND_SERIAL_PORT",
+            "COM8",
+        ).strip(),
+        command_serial_baud=int(
+            os.environ.get("SECONDARY_COMMAND_SERIAL_BAUD", "57600").strip()
         ),
         firewall_rule_name=os.environ.get(
             "SECONDARY_FIREWALL_RULE_NAME",

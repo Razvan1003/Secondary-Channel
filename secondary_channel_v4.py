@@ -1,5 +1,7 @@
 import os
+import queue
 import sys
+import threading
 import time
 
 try:
@@ -34,12 +36,22 @@ COMMAND_CONNECTION = os.environ.get(
     "SECONDARY_CHANNEL_COMMAND_CONNECTION",
     "tcp:127.0.0.1:5782",
 ).strip()
+HARDWARE_MODE = env_flag("SECONDARY_HARDWARE_MODE", False)
+MONITOR_BAUD = int(
+    os.environ.get("SECONDARY_CHANNEL_MONITOR_BAUD", "921600").strip()
+)
+COMMAND_BAUD = int(
+    os.environ.get("SECONDARY_CHANNEL_COMMAND_BAUD", "57600").strip()
+)
 HEARTBEAT_TIMEOUT = 5
 CHECK_INTERVAL = 0.2
 COMMAND_ACK_TIMEOUT = 3
 HOLD_SEND_INTERVAL = 0.5
 POSITION_CAPTURE_TIMEOUT = 1.0
 GLOBAL_POSITION_INTERVAL_US = 1000000
+POSITION_STREAM_FALLBACK_TIMEOUT = 2.0
+POSITION_STREAM_FALLBACK_RATE_HZ = 5
+MONITOR_POSITION_STREAM_REFRESH_INTERVAL = 3.0
 MONITOR_CONNECT_TIMEOUT = 10.0
 SECONDARY_HEARTBEAT_TIMEOUT = 1.5
 SECONDARY_LOG_INTERVAL = 1.0
@@ -48,6 +60,7 @@ SECONDARY_CONNECT_TIMEOUT = 10.0
 COMMAND_RECONNECT_INTERVAL = 5.0
 COMMAND_TRUST_ESTABLISH_TIMEOUT = 5.0
 GCS_HEARTBEAT_INTERVAL = 1.0
+MODE_CHANGE_RETRY_INTERVAL = 1.0
 ARM_DISARM_STATE_TIMEOUT = 5.0
 TAKEOFF_STATE_TIMEOUT = 12.0
 COMMAND_LOOP_OBSERVATION_WINDOW = 1.0
@@ -147,6 +160,8 @@ STATUS = {
 }
 
 LOG_FILE_HANDLE = None
+STDIN_INPUT_QUEUE = queue.SimpleQueue()
+STDIN_READER_THREAD = None
 
 
 def timestamp():
@@ -262,6 +277,11 @@ def validate_endpoint(label, endpoint):
         raise ValueError(
             f"{label} endpoint contains placeholder text: {endpoint}"
         )
+
+
+def is_serial_endpoint(endpoint):
+    endpoint_lower = endpoint.strip().lower()
+    return endpoint_lower.startswith("com") or endpoint_lower.startswith("/dev/tty")
 
 
 def parse_signing_key(secret_text):
@@ -505,6 +525,24 @@ def configure_link_signing(master, link_label, enabled, sign_outgoing, policy, l
         raise
 
 
+def log_runtime_configuration():
+    log_event(
+        "INFO",
+        "RUNTIME_CONFIG_LOADED",
+        f"hardware_mode={str(HARDWARE_MODE).lower()}",
+    )
+    log_event(
+        "INFO",
+        "CONNECTION_CONFIG",
+        f"monitor={MONITOR_CONNECTION} monitor_baud={MONITOR_BAUD}",
+    )
+    log_event(
+        "INFO",
+        "CONNECTION_CONFIG",
+        f"command={COMMAND_CONNECTION} command_baud={COMMAND_BAUD}",
+    )
+
+
 def log_security_configuration():
     log_event(
         "INFO",
@@ -532,6 +570,9 @@ def open_mavlink_endpoint(event_name, endpoint):
     )
     validate_endpoint(event_name, endpoint)
     try:
+        if is_serial_endpoint(endpoint):
+            baud_rate = MONITOR_BAUD if "MONITOR" in event_name else COMMAND_BAUD
+            return mavutil.mavlink_connection(endpoint, baud=baud_rate)
         return mavutil.mavlink_connection(endpoint)
     except Exception as error:
         raise ConnectionError(
@@ -593,6 +634,49 @@ def update_status_from_global_position(status, message):
     status["current_altitude"] = message.relative_alt / 1000.0
 
 
+def request_monitor_position_stream(
+    monitor_master,
+    target_system,
+    target_component,
+    log_request=False,
+):
+    try:
+        monitor_master.mav.command_long_send(
+            target_system,
+            target_component,
+            mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+            0,
+            mavutil.mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT,
+            GLOBAL_POSITION_INTERVAL_US,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+        monitor_master.mav.request_data_stream_send(
+            target_system,
+            target_component,
+            mavutil.mavlink.MAV_DATA_STREAM_POSITION,
+            POSITION_STREAM_FALLBACK_RATE_HZ,
+            1,
+        )
+        if log_request:
+            log_event(
+                "INFO",
+                "MONITOR_POSITION_STREAM_REQUESTED",
+                f"message=GLOBAL_POSITION_INT rate_hz={POSITION_STREAM_FALLBACK_RATE_HZ}",
+            )
+    except Exception as error:
+        if log_request:
+            log_event(
+                "WARN",
+                "MONITOR_POSITION_STREAM_REQUEST_FAILED",
+                f"message={error}",
+            )
+
+
 def heading_radians_from_global_position(message):
     if message is None or getattr(message, "hdg", 65535) == 65535:
         return None
@@ -640,6 +724,7 @@ def connect_monitor_link():
         "SCRIPT_STARTED",
         f"log_file={os.path.basename(LOG_FILE_PATH)}",
     )
+    log_runtime_configuration()
     log_security_configuration()
     monitor_master = open_mavlink_endpoint(
         "MONITOR_CONNECT_ATTEMPT",
@@ -679,6 +764,12 @@ def connect_monitor_link():
                 f"connection={MONITOR_CONNECTION} "
                 f"system={target_system} component={target_component}"
             ),
+        )
+        request_monitor_position_stream(
+            monitor_master,
+            target_system,
+            target_component,
+            log_request=True,
         )
         log_monitor_mode_if_changed()
         return monitor_master, target_system, target_component
@@ -750,20 +841,20 @@ def connect_command_link(target_system, target_component):
             target_system,
             target_component,
         )
-        if command_signing_is_strict():
-            if STATUS["command_operational_proof_seen"]:
-                log_event("INFO", "COMMAND_LINK_TRUSTED", "link=command")
-            else:
-                log_event(
-                    "WARN",
-                    "SIGNED_CONTROL_NOT_VERIFIED",
-                    "link=command reason=no_operational_command_ack",
-                )
-                log_event(
-                    "WARN",
-                    "COMMAND_LINK_CONNECTED_BUT_NOT_TRUSTED",
-                    "link=command reason=no_operational_command_ack",
-                )
+        if command_link_is_trusted_for_control():
+            log_event("INFO", "COMMAND_LINK_TRUSTED", "link=command")
+        elif command_signing_is_strict():
+            reason = command_control_block_reason()
+            log_event(
+                "WARN",
+                "SIGNED_CONTROL_NOT_VERIFIED",
+                f"link=command reason={reason}",
+            )
+            log_event(
+                "WARN",
+                "COMMAND_LINK_CONNECTED_BUT_NOT_TRUSTED",
+                f"link=command reason={reason}",
+            )
         return command_master
 
     log_event(
@@ -866,7 +957,57 @@ def open_manual_menu():
     print("Menu active: press G/R/H/L/A/D/T/C/M/Q.")
 
 
+def start_optional_stdin_reader():
+    global STDIN_READER_THREAD
+    if STDIN_READER_THREAD is not None:
+        return
+
+    try:
+        stdin_is_tty = sys.stdin.isatty()
+    except Exception:
+        stdin_is_tty = True
+
+    if stdin_is_tty:
+        return
+
+    def read_stdin_forever():
+        while True:
+            chunk = sys.stdin.read(1)
+            if chunk == "":
+                break
+            STDIN_INPUT_QUEUE.put(chunk)
+
+    STDIN_READER_THREAD = threading.Thread(
+        target=read_stdin_forever,
+        name="secondary-channel-stdin",
+        daemon=True,
+    )
+    STDIN_READER_THREAD.start()
+
+
+def normalize_control_key(key):
+    if key in ("\r", "\n"):
+        return "enter"
+    if key == "\x08":
+        return "backspace"
+    if key == "\x1b":
+        return "escape"
+    return key.lower()
+
+
+def read_stdin_pipe_key_nonblocking():
+    try:
+        key = STDIN_INPUT_QUEUE.get_nowait()
+    except queue.Empty:
+        return None
+    return normalize_control_key(key)
+
+
 def read_control_key_nonblocking():
+    stdin_key = read_stdin_pipe_key_nonblocking()
+    if stdin_key is not None:
+        return stdin_key
+
     if msvcrt is None or not msvcrt.kbhit():
         return None
 
@@ -875,13 +1016,7 @@ def read_control_key_nonblocking():
         if msvcrt.kbhit():
             msvcrt.getwch()
         return None
-    if key == "\r":
-        return "enter"
-    if key == "\x08":
-        return "backspace"
-    if key == "\x1b":
-        return "escape"
-    return key.lower()
+    return normalize_control_key(key)
 
 
 def begin_takeoff_altitude_prompt():
@@ -1027,6 +1162,7 @@ def register_command_ack_proof(message, command_label):
             "COMMAND_ACK_WITHOUT_SIGNED_METADATA",
             f"link=command command={command_label}",
         )
+        return
 
     if command_signing_is_strict():
         newly_trusted = not command_link_is_trusted_for_control()
@@ -1062,6 +1198,19 @@ def request_global_position_int_stream(command_master, target_system, target_com
         if message is None:
             continue
 
+        if (
+            message.get_type() == "GLOBAL_POSITION_INT"
+            and message.get_srcSystem() == target_system
+        ):
+            mark_command_observation_active()
+            update_status_from_global_position(STATUS, message)
+            log_event(
+                "INFO",
+                "POSITION_STREAM_ACTIVE",
+                "message=GLOBAL_POSITION_INT source=interval_request",
+            )
+            return
+
         if message.get_type() != "COMMAND_ACK":
             continue
 
@@ -1085,6 +1234,34 @@ def request_global_position_int_stream(command_master, target_system, target_com
         "COMMAND_ACK_MISSING",
         "command=MAV_CMD_SET_MESSAGE_INTERVAL message=GLOBAL_POSITION_INT",
     )
+
+    command_master.mav.request_data_stream_send(
+        target_system,
+        target_component,
+        mavutil.mavlink.MAV_DATA_STREAM_POSITION,
+        POSITION_STREAM_FALLBACK_RATE_HZ,
+        1,
+    )
+
+    fallback_deadline = monotonic_time() + POSITION_STREAM_FALLBACK_TIMEOUT
+    while monotonic_time() < fallback_deadline:
+        maybe_send_gcs_heartbeat(command_master)
+        message = command_master.recv_match(blocking=True, timeout=CHECK_INTERVAL)
+        if message is None:
+            continue
+
+        if (
+            message.get_type() == "GLOBAL_POSITION_INT"
+            and message.get_srcSystem() == target_system
+        ):
+            mark_command_observation_active()
+            update_status_from_global_position(STATUS, message)
+            log_event(
+                "INFO",
+                "POSITION_STREAM_ACTIVE",
+                "message=GLOBAL_POSITION_INT source=request_data_stream_fallback",
+            )
+            return
 
 
 def poll_command_link_state(command_master, target_system, target_component):
@@ -1200,10 +1377,20 @@ def wait_for_mode(
     target_component,
     expected_mode,
     timeout=5.0,
+    resend_callback=None,
 ):
     deadline = monotonic_time() + timeout
+    last_resend_time = 0.0
 
     while monotonic_time() < deadline:
+        current_time = monotonic_time()
+        if (
+            resend_callback is not None
+            and current_time - last_resend_time >= MODE_CHANGE_RETRY_INTERVAL
+        ):
+            resend_callback()
+            last_resend_time = current_time
+
         if STATUS["current_mode"] == expected_mode:
             log_event(
                 "INFO",
@@ -1268,13 +1455,12 @@ def send_mode_change_and_confirm(
     log_event(
         "INFO",
         "COMMAND_SENT",
-        f"command=SET_MODE mode={mode_name} custom_mode={custom_mode}",
+        (
+            "command=SET_MODE "
+            f"mode={mode_name} custom_mode={custom_mode} method=COMMAND_LONG"
+        ),
     )
-    command_master.mav.set_mode_send(
-        target_system,
-        mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-        custom_mode,
-    )
+    maybe_send_gcs_heartbeat(command_master, force=True)
 
     return wait_for_mode(
         command_master,
@@ -1282,42 +1468,17 @@ def send_mode_change_and_confirm(
         target_component,
         mode_name,
         timeout=timeout,
+        resend_callback=lambda: command_master.set_mode(mode_name),
     )
 
 
 def send_rtl_and_wait_ack(command_master, target_system, target_component):
-    drain_messages(command_master)
-
     log_event(
         "INFO",
-        "COMMAND_SENT",
-        "command=MAV_CMD_NAV_RETURN_TO_LAUNCH",
+        "MODE_CHANGE_REQUESTED",
+        "mode=RTL",
     )
-    command_master.mav.command_long_send(
-        target_system,
-        target_component,
-        mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-    )
-
-    ack_ok = wait_for_command_ack(
-        command_master,
-        target_system,
-        target_component,
-        mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH,
-        "RTL",
-    )
-    if not ack_ok:
-        return False
-
-    return wait_for_mode(
+    return send_mode_change_and_confirm(
         command_master,
         target_system,
         target_component,
@@ -1328,33 +1489,17 @@ def send_rtl_and_wait_ack(command_master, target_system, target_component):
 
 # Command-long actions still rely on COMMAND_ACK.
 def send_land_and_wait_ack(command_master, target_system, target_component):
-    drain_messages(command_master)
-
     log_event(
         "INFO",
-        "COMMAND_SENT",
-        "command=MAV_CMD_NAV_LAND",
+        "MODE_CHANGE_REQUESTED",
+        "mode=LAND",
     )
-    command_master.mav.command_long_send(
-        target_system,
-        target_component,
-        mavutil.mavlink.MAV_CMD_NAV_LAND,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-    )
-
-    return wait_for_command_ack(
+    return send_mode_change_and_confirm(
         command_master,
         target_system,
         target_component,
-        mavutil.mavlink.MAV_CMD_NAV_LAND,
         "LAND",
+        timeout=8.0,
     )
 
 
@@ -1663,6 +1808,8 @@ def command_signing_is_strict():
 def command_control_block_reason():
     if command_signing_is_strict() and not STATUS["command_operational_proof_seen"]:
         return "no_operational_command_ack"
+    if command_signing_is_strict() and not STATUS["command_crypto_metadata_seen"]:
+        return "no_signed_command_ack"
     if STATUS["command_unsigned_seen"]:
         return "unsigned_or_invalid_signed_feedback_seen"
     if STATUS["command_observation_active"]:
@@ -1676,6 +1823,7 @@ def command_link_is_trusted_for_control():
     return (
         STATUS["command_control_trusted"]
         and STATUS["command_operational_proof_seen"]
+        and STATUS["command_crypto_metadata_seen"]
     )
 
 
@@ -2567,7 +2715,8 @@ def secondary_command_loop(
     first_observation = True
     last_security_block_log_time = 0.0
     quick_controls_announced = False
-    interaction_mode = "menu"
+    interaction_mode = "observe"
+    initial_failover_menu_pending = True
 
     while True:
         STATUS["ui_modal_active"] = False
@@ -2579,6 +2728,14 @@ def secondary_command_loop(
         )
         if command_position is not None:
             latest_command_global_position = command_position
+
+        if initial_failover_menu_pending and interaction_mode == "observe":
+            interaction_mode = "menu"
+            log_event(
+                "INFO",
+                "INITIAL_FAILOVER_MENU_SHOWN",
+                "source=post_failover",
+            )
 
         if interaction_mode == "menu":
             modal_result = run_menu_mode(
@@ -2623,8 +2780,22 @@ def secondary_command_loop(
                     "session_result": "secondary_not_trusted",
                 }
             if modal_result["result"] == "observe":
+                if initial_failover_menu_pending:
+                    log_event(
+                        "INFO",
+                        "INITIAL_FAILOVER_MENU_CLOSED",
+                        "result=observe",
+                    )
+                    initial_failover_menu_pending = False
                 interaction_mode = "observe"
                 continue
+            if initial_failover_menu_pending:
+                log_event(
+                    "INFO",
+                    "INITIAL_FAILOVER_MENU_CLOSED",
+                    "result=action",
+                )
+                initial_failover_menu_pending = False
             action = modal_result["action"]
             takeoff_altitude_m = modal_result.get(
                 "altitude",
@@ -2816,7 +2987,7 @@ def secondary_command_loop(
                 takeoff_altitude_m = prompt_result["altitude"]
 
         log_event("INFO", "ACTION_SELECTED", f"action={action.upper()}")
-        interaction_mode = "menu"
+        interaction_mode = "observe"
         quick_controls_announced = False
         STATUS["ui_modal_active"] = False
 
@@ -2849,6 +3020,12 @@ def secondary_command_loop(
         elif action_ok:
             hold_active = False
             hold_target = None
+        if action_ok:
+            log_event(
+                "INFO",
+                "ACTION_EXECUTION_SUCCEEDED",
+                f"action={action.upper()}",
+            )
         else:
             log_event(
                 "WARN",
@@ -2862,7 +3039,7 @@ def secondary_command_loop(
             )
         log_event(
             "INFO",
-            "POST_ACTION_RETURN_TO_MENU",
+            "POST_ACTION_RETURN_TO_OBSERVE",
             f"action={action.upper()} result={'success' if action_ok else 'failed'}",
         )
 
@@ -2900,12 +3077,25 @@ def monitor_heartbeat(monitor_master, command_master, target_system, target_comp
     secondary_session_started = False
     last_command_reconnect_attempt = 0.0
     security_block_logged = False
+    last_monitor_position_stream_request = 0.0
 
     STATUS["link_state"] = "MONITOR_OK"
 
     while True:
         current_time = monotonic_time()
-        if should_reconnect_command_link(command_master):
+        if (
+            not emergency_active
+            and current_time - last_monitor_position_stream_request
+            >= MONITOR_POSITION_STREAM_REFRESH_INTERVAL
+        ):
+            request_monitor_position_stream(
+                monitor_master,
+                target_system,
+                target_component,
+            )
+            last_monitor_position_stream_request = current_time
+
+        if emergency_active and should_reconnect_command_link(command_master):
             if (
                 command_master is not None
                 and command_signing_is_strict()
@@ -3064,6 +3254,7 @@ def main():
 
     try:
         init_log_file()
+        start_optional_stdin_reader()
         monitor_master, target_system, target_component = connect_monitor_link()
         command_master = connect_command_link(target_system, target_component)
         monitor_heartbeat(
